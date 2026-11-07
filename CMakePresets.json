@@ -1,0 +1,58 @@
+{
+    "version": 8,
+    "configurePresets": [
+        {
+            "name": "clang",
+            "displayName": "Clang (ucrt64)",
+            "description": "Using compilers: C = D:\\Portable\\msys64\\ucrt64\\bin\\clang.exe, CXX = D:\\Portable\\msys64\\ucrt64\\bin\\clang++.exe",
+            "binaryDir": "${sourceDir}/build/",
+            "generator": "Ninja",
+            "cacheVariables": {
+                "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/${presetName}",
+                "CMAKE_C_COMPILER": "clang.exe",
+                "CMAKE_CXX_COMPILER": "clang++.exe",
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+            }
+        },
+        {
+            "name": "msvc",
+            "displayName": "Visual Studio",
+            "description": "Using compilers for Visual Studio 17 2022 (x64 architecture)",
+            "generator": "Ninja",
+            "toolset": {
+                "value": "host=x64",
+                "strategy": "external"
+            },
+            "architecture": {
+                "value": "x64",
+                "strategy": "external"
+            },
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_INSTALL_PREFIX": "${sourceDir}/install",
+                "CMAKE_C_COMPILER": "cl.exe",
+                "CMAKE_CXX_COMPILER": "cl.exe",
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+            }
+        },
+        {
+            "name": "gcc",
+            "displayName": "GCC (ucrt64)",
+            "description": "Using compilers: C = D:\\Portable\\msys64\\ucrt64\\bin\\gcc.exe, CXX = D:\\Portable\\msys64\\ucrt64\\bin\\g++.exe",
+            "binaryDir": "${sourceDir}/build/",
+            "generator": "Ninja",
+            "cacheVariables": {
+                "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/${presetName}",
+                "CMAKE_C_COMPILER": "gcc.exe",
+                "CMAKE_CXX_COMPILER": "g++.exe",
+                "CMAKE_Fortran_COMPILER": "gfortran.exe",
+                "Python_EXECUTABLE": "D:/micromamba/envs/py12/python.exe",
+                "Python3_EXECUTABLE": "D:/micromamba/envs/py12/python.exe",
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+            }
+        }
+    ]
+}

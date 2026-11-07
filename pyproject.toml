@@ -1,0 +1,21 @@
+[build-system]
+requires = ["scikit-build-core>=0.8.0", "nanobind>=2.0.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "fast_bemt"
+version = "0.1.0"
+description = "High-performance vectorized and differentiable oblique-inflow BEMT solver"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.22",
+]
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+wheel.packages = ["python/fast_bemt"]
+build-dir = "build/{wheel_tag}"
+
+[tool.scikit-build.cmake.define]
+FAST_BEMT_ENABLE_SIMD = "ON"
