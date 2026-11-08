@@ -46,17 +46,36 @@ find_package(OpenMP REQUIRED)
 option(FAST_BEMT_ENABLE_SIMD "Enable AVX2 and FMA vectorization instructions" ON)
 
 add_library(bemt_compiler_flags INTERFACE)
+
 if(MSVC)
+    find_package(OpenMP REQUIRED)
     target_compile_options(bemt_compiler_flags INTERFACE /O2 /fp:fast /EHsc)
     if(FAST_BEMT_ENABLE_SIMD)
         target_compile_options(bemt_compiler_flags INTERFACE /arch:AVX2)
     endif()
+    target_link_libraries(bemt_compiler_flags INTERFACE OpenMP::OpenMP_CXX)
+
+elseif(MINGW)
+    # 【关键修改】MinGW 下不走 find_package(OpenMP) 的链接目标，防止引入 libgomp.dll.a
+    target_compile_options(bemt_compiler_flags INTERFACE -O3 -ffast-math -Wall -Wextra -fopenmp)
+    if(FAST_BEMT_ENABLE_SIMD)
+        target_compile_options(bemt_compiler_flags INTERFACE -march=native -mavx2 -mfma)
+    endif()
+    # 静态链接标准库运行时
+    target_link_options(bemt_compiler_flags INTERFACE -static-libgcc -static-libstdc++)
+    # 放在 target_link_libraries 中，确保在 bemt_core 静态库【之后】被链接器扫描
+    target_link_libraries(bemt_compiler_flags INTERFACE 
+        "-Wl,-Bstatic" gomp winpthread "-Wl,-Bdynamic"
+    )
+
 else()
-    # GCC / Clang / MinGW-w64 (UCRT64)
+    # Linux / macOS
+    find_package(OpenMP REQUIRED)
     target_compile_options(bemt_compiler_flags INTERFACE -O3 -ffast-math -Wall -Wextra)
     if(FAST_BEMT_ENABLE_SIMD)
         target_compile_options(bemt_compiler_flags INTERFACE -march=native -mavx2 -mfma)
     endif()
+    target_link_libraries(bemt_compiler_flags INTERFACE OpenMP::OpenMP_CXX)
 endif()
 
 # ==============================================================================
@@ -72,7 +91,6 @@ set(BEMT_BINDING_SOURCES
     src/bindings.cpp
 )
 
-# 自动生成尚未编写的源文件占位符，确保分步开发时 CMake 随时可以 configure 通过
 foreach(src_file IN LISTS BEMT_CORE_SOURCES BEMT_BINDING_SOURCES)
     if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${src_file}")
         get_filename_component(src_dir "${CMAKE_CURRENT_SOURCE_DIR}/${src_file}" DIRECTORY)
@@ -85,9 +103,9 @@ add_library(bemt_core STATIC ${BEMT_CORE_SOURCES})
 target_include_directories(bemt_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
+# 【关键修改】去掉这里的 OpenMP::OpenMP_CXX，所有配置已集成在 bemt_compiler_flags 中
 target_link_libraries(bemt_core PUBLIC
     Eigen3::Eigen
-    OpenMP::OpenMP_CXX
     bemt_compiler_flags
 )
 
@@ -111,16 +129,17 @@ nanobind_add_module(
     ${BEMT_BINDING_SOURCES}
 )
 
+# 链接 bemt_core 时，会自动按正确顺序继承 bemt_compiler_flags 中的静态 gomp 设置
 target_link_libraries(_fast_bemt_impl PRIVATE bemt_core)
 
-# 在 MinGW-w64 下静态链接标准库与 OpenMP/pthread 运行时，彻底消除 Python 导入 .pyd 时的 DLL 缺失问题
-if(MINGW)
-    target_link_options(_fast_bemt_impl PRIVATE
-        -static-libgcc
-        -static-libstdc++
-        -Wl,-Bstatic -lgomp -lwinpthread -Wl,-Bdynamic
-    )
-endif()
+# 1. 编译时直接将 .pyd 输出到 python/fast_bemt 目录下（免去每次手动执行 cmake --install）
+set_target_properties(_fast_bemt_impl PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/python/fast_bemt"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/python/fast_bemt"
+)
 
-# 安装扩展模块到 fast_bemt Python 包目录下
-install(TARGETS _fast_bemt_impl LIBRARY DESTINATION fast_bemt)
+# 2. 若执行 cmake --install build，同样安装到 python/fast_bemt 目录下
+install(TARGETS _fast_bemt_impl
+    LIBRARY DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}/python/fast_bemt"
+    RUNTIME DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}/python/fast_bemt"
+)

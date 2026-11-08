@@ -267,6 +267,15 @@ inline Dual<N> pow(const Dual<N>& x, double p) {
 }
 
 template <int N>
+inline Dual<N> pow(const Dual<N>& x, const Dual<N>& y) {
+    const double safe_x = std::max(x.val, 1e-30);
+    const double v      = std::pow(safe_x, y.val);
+    const double dv_dx  = y.val * std::pow(safe_x, y.val - 1.0);
+    const double dv_dy  = v * std::log(safe_x);
+    return Dual<N>(v, dv_dx * x.d + dv_dy * y.d);
+}
+
+template <int N>
 inline Dual<N> abs(const Dual<N>& x) {
     return (x.val >= 0.0) ? x : -x;
 }
