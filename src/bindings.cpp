@@ -1,3 +1,5 @@
+#include <omp.h>
+
 #include <nanobind/nanobind.h>
 #include <nanobind/eigen/dense.h>
 #include <nanobind/stl/pair.h>
@@ -287,4 +289,9 @@ NB_MODULE(_fast_bemt_impl, m) {
              "Solve multiple operating conditions in parallel via OpenMP")
         .def_prop_ro("geometry", &BEMTSolver::geometry)
         .def_prop_ro("config", &BEMTSolver::config);
+
+    m.def("set_num_threads", &omp_set_num_threads, "num_threads"_a,
+        "Set the number of OpenMP threads used by BEMTSolver");
+    m.def("get_max_threads", &omp_get_max_threads,
+        "Get current maximum number of OpenMP threads");
 }

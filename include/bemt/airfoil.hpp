@@ -68,39 +68,41 @@ public:
         const Scalar lre_clamped = clamp_coord(log_re, log_re_grid_);
         const Scalar ma_clamped  = clamp_coord(ma, ma_grid_);
 
-        // 2. 在表格迎角范围内计算三立方 Hermite 插值结果
+        const double a_min = alpha_grid_[0];
+        const double a_max = alpha_grid_[n_a_ - 1];
+        const double blend_width = 1.0 * kDeg2Rad; // 1度紧凑过渡带
+        const double a_val = val_of(alpha);
+
+        // 2. 快速通道：只要迎角在 [a_min + 2*width, a_max - 2*width] 内，100% 走纯表格三立方插值
+        if (!enable_extrapolation_ ||
+            (a_val >= a_min + 2.0 * blend_width && a_val <= a_max - 2.0 * blend_width)) {
+            const Scalar alpha_clamped = clamp_coord(alpha, alpha_grid_);
+            return eval_tricubic_table(alpha_clamped, lre_clamped, ma_clamped);
+        }
+
+        // 3. 若完全处于深失速外推区 (超出边界 > 3*width)，无需再算内部表格插值
+        const double lre_v = val_of(lre_clamped);
+        const double ma_v  = val_of(ma_clamped);
+        auto [cl_hi_v, cd_hi_v] = eval_tricubic_table<double>(a_max, lre_v, ma_v);
+        auto [cl_lo_v, cd_lo_v] = eval_tricubic_table<double>(a_min, lre_v, ma_v);
+
+        auto [cl_vc, cd_vc] = eval_viterna_corrigan(
+            alpha, Scalar(cl_hi_v), Scalar(cd_hi_v), Scalar(cl_lo_v), Scalar(cd_lo_v));
+
+        if (a_val <= a_min - 3.0 * blend_width || a_val >= a_max + 3.0 * blend_width) {
+            return {cl_vc, cd_vc};
+        }
+
+        // 4. 仅在边界 +/- 2~3 度窄带内平滑混合表格与 Viterna-Corrigan
         const Scalar alpha_clamped = clamp_coord(alpha, alpha_grid_);
         auto [cl_tbl, cd_tbl] = eval_tricubic_table(alpha_clamped, lre_clamped, ma_clamped);
 
-        if (!enable_extrapolation_) {
-            return {cl_tbl, cd_tbl};
-        }
-
-        // 3. 若迎角接近或超出表格边界，平滑混合 Viterna-Corrigan 全迎角 [-pi, pi] 极曲线
-        const double a_min = alpha_grid_[0];
-        const double a_max = alpha_grid_[n_a_ - 1];
-        const double blend_width = 2.0 * kDeg2Rad; // 2度平滑过渡带
-
-        // 当 alpha 完全处于 [a_min + 4*width, a_max - 4*width] 内部时，直接返回表格值（加速 95% 常规点）
-        const double a_val = val_of(alpha);
-        if (a_val >= a_min + 4.0 * blend_width && a_val <= a_max - 4.0 * blend_width) {
-            return {cl_tbl, cd_tbl};
-        }
-
-        // 计算高低边界处的表格气动系数（固定当前 Re, Ma）
-        auto [cl_hi_stall, cd_hi_stall] = eval_tricubic_table(Scalar(a_max), lre_clamped, ma_clamped);
-        auto [cl_lo_stall, cd_lo_stall] = eval_tricubic_table(Scalar(a_min), lre_clamped, ma_clamped);
-
-        auto [cl_vc, cd_vc] = eval_viterna_corrigan(alpha, cl_hi_stall, cd_hi_stall, cl_lo_stall, cd_lo_stall);
-
-        // 构造双侧 Sigmoid 窗口权重: 在 [a_min, a_max] 内部 w_in -> 1，外部 w_in -> 0
         const Scalar w_low  = math::sigmoid_weight(alpha, a_min, blend_width);
         const Scalar w_high = Scalar(1.0) - math::sigmoid_weight(alpha, a_max, blend_width);
         const Scalar w_in   = w_low * w_high;
 
-        const Scalar cl_final = w_in * cl_tbl + (Scalar(1.0) - w_in) * cl_vc;
-        const Scalar cd_final = w_in * cd_tbl + (Scalar(1.0) - w_in) * cd_vc;
-        return {cl_final, cd_final};
+        return {w_in * cl_tbl + (Scalar(1.0) - w_in) * cl_vc,
+                w_in * cd_tbl + (Scalar(1.0) - w_in) * cd_vc};
     }
 
     // ------------------------------------------------------------------------

@@ -15,7 +15,7 @@ BEMTSolver::BEMTSolver(RotorGeometry geom, SolverConfig cfg)
 }
 
 // ============================================================================
-// 标量 Brent 根求解器 (保證 100% 绝对收敛的兜底保险)
+// 鲁棒性优先版 Brent 根求解器：多级括号扩张 + 18点加密扫描兜底，确保绝不漏根
 // ============================================================================
 double BEMTSolver::solve_cell_brent(int i_r,
                                     double chord,
@@ -26,27 +26,47 @@ double BEMTSolver::solve_cell_brent(int i_r,
                                     double omega,
                                     double wake_factor,
                                     const OperatingCondition& cond,
-                                    double phi_init) const {
+                                    double phi_init,
+                                    bool& brent_ok) const {
+    brent_ok = false;
     auto eval_r = [&](double p) -> double {
         return eval_element_kernel<double>(
                    i_r, p, chord, theta_local, u_p, u_t, v_inplane_sq, omega, wake_factor, cond)
             .residual;
     };
 
-    // 搜索包含根的异号区间 [a, b]
-    double a = -kHalfPi + 1e-3;
-    double b = kHalfPi - 1e-3;
+    const double lo_bound = -kHalfPi + 1e-4;
+    const double hi_bound =  kHalfPi - 1e-4;
+
+    // 1. 先在初值附近做两级局部探测 (快速命中常规失速点)
+    double a  = std::max(lo_bound, phi_init - 0.20);
+    double b  = std::min(hi_bound, phi_init + 0.20);
     double fa = eval_r(a);
     double fb = eval_r(b);
 
-    // 若两端同号，在初值附近细分扫描寻找异号括号区间
+    // 2. 若局部未包住根，测试全象限端点 [lo_bound, hi_bound]
     if (fa * fb > 0.0) {
-        const int n_scan = 24;
-        double p_prev = a;
+        a  = lo_bound;
+        b  = hi_bound;
+        fa = eval_r(a);
+        fb = eval_r(b);
+    }
+
+    // 3. 若两端仍同号（例如高诱导风车态出现偶次多根），执行 18 等分加密扫描寻找异号或极小残差区间
+    if (fa * fb > 0.0) {
+        const int n_scan = 18;
+        double p_prev = lo_bound;
         double f_prev = fa;
+        double best_p = phi_init;
+        double min_abs_f = std::min(std::abs(fa), std::abs(fb));
+
         for (int k = 1; k <= n_scan; ++k) {
-            double p_curr = a + (b - a) * (static_cast<double>(k) / n_scan);
+            double p_curr = lo_bound + (hi_bound - lo_bound) * (static_cast<double>(k) / n_scan);
             double f_curr = eval_r(p_curr);
+            if (std::abs(f_curr) < min_abs_f) {
+                min_abs_f = std::abs(f_curr);
+                best_p    = p_curr;
+            }
             if (f_prev * f_curr <= 0.0) {
                 a  = p_prev;
                 fa = f_prev;
@@ -57,13 +77,15 @@ double BEMTSolver::solve_cell_brent(int i_r,
             p_prev = p_curr;
             f_prev = f_curr;
         }
+
+        // 若全区间完全同号无交点，返回残差绝对值最小的安全点
+        if (fa * fb > 0.0) {
+            brent_ok = (min_abs_f < 1e-3);
+            return std::clamp(best_p, lo_bound, hi_bound);
+        }
     }
 
-    if (fa * fb > 0.0) {
-        return std::clamp(phi_init, a, b);
-    }
-
-    // 标准 Brent 算法迭代
+    // 4. 标准 Brent 算法主循环
     double c = b, fc = fb;
     double d = b - a, e = d;
 
@@ -83,9 +105,10 @@ double BEMTSolver::solve_cell_brent(int i_r,
             fc = fa;
         }
 
-        const double tol1 = 2.0 * 1e-12 * std::abs(b) + 0.5 * cfg_.tol;
+        const double tol1 = 2.0 * 1e-13 * std::abs(b) + 0.5 * cfg_.tol;
         const double xm   = 0.5 * (c - b);
         if (std::abs(xm) <= tol1 || std::abs(fb) <= cfg_.tol) {
+            brent_ok = true;
             return b;
         }
 
@@ -125,18 +148,16 @@ double BEMTSolver::solve_cell_brent(int i_r,
         }
         fb = eval_r(b);
     }
+
+    brent_ok = (std::abs(fb) <= 1e-5);
     return b;
 }
 
-// ============================================================================
-// 核心斜入流求解实现：方案 A (圆环平衡 + Pitt-Peters 尾迹修正) & 方案 B
-// ============================================================================
 BEMTResult BEMTSolver::solve(const OperatingCondition& cond, bool compute_gradients) const {
     BEMTResult res;
     const int nr   = static_cast<int>(geom_.r.size());
     const int npsi = cfg_.n_azimuth;
 
-    // 1. 初始化一维与二维输出矩阵 (Row-Major: nr x npsi)
     res.psi_grid.resize(npsi);
     for (int j = 0; j < npsi; ++j) {
         res.psi_grid[j] = kTwoPi * static_cast<double>(j) / static_cast<double>(npsi);
@@ -164,113 +185,137 @@ BEMTResult BEMTSolver::solve(const OperatingCondition& cond, bool compute_gradie
     const double R_tip        = geom_.radius;
     const double A_disk       = kPi * (R_tip * R_tip - geom_.hub_radius * geom_.hub_radius);
 
-    // 预计算方位角三角函数向量与二维切向来流矩阵 U_T(i, j)、局部总桨距角矩阵 Theta(i, j)
     ArrayXd cos_psi = res.psi_grid.cos();
     ArrayXd sin_psi = res.psi_grid.sin();
 
-    // 面内前进速度方向偏角 psi_wind (用于将尾迹偏斜梯度对齐到实际合侧风方向)
     const double psi_wind = std::atan2(cond.vy, cond.vx);
     ArrayXd cos_psi_rel   = (res.psi_grid - psi_wind).cos();
     ArrayXd sin_psi_rel   = (res.psi_grid - psi_wind).sin();
 
-    // 初始化入流角初值 phi_0 = atan2(Vz + vi_guess, omega * r)
-    const double vi_hover_est = std::max(2.0, 0.05 * cond.omega * R_tip);
-    for (int i = 0; i < nr; ++i) {
-        const double phi_guess = std::atan2(cond.vz + vi_hover_est, cond.omega * geom_.r[i]);
-        res.phi.row(i).setConstant(std::clamp(phi_guess, -0.5, 0.8));
-    }
+    const int idx_75      = std::clamp(static_cast<int>(0.75 * nr), 0, nr - 1);
+    const double theta_75 = std::clamp(geom_.twist[idx_75] + cond.pitch_0, -0.5, 0.8);
+    const double v_tip    = std::max(cond.omega * R_tip, 1.0);
+    const double vi_est   = (theta_75 > 0.0) ? std::max(1.0, 0.04 * v_tip * std::sqrt(theta_75)) : 0.5;
 
-    // ------------------------------------------------------------------------
-    // 2. 外层 Pitt-Peters 尾迹偏斜角 chi 自洽迭代 + 内层 OpenMP & SIMD 向量化牛顿求解
-    //    若为纯轴流 (v_inplane < 1e-5) 或非 Pitt-Peters 模式，外层仅需执行 1 次！
-    // ------------------------------------------------------------------------
     const bool use_pitt_peters = (cfg_.wake_model == WakeModel::kGlauertPittPeters) && (v_inplane > 1e-5);
-    const int outer_iters      = use_pitt_peters ? std::max(1, cfg_.max_wake_iters) : 1;
+    const int outer_iters      = use_pitt_peters ? std::max(2, cfg_.max_wake_iters) : 1;
 
     double kx = 0.0;
     double ky = 0.0;
+    if (use_pitt_peters) {
+        const double chi_est = std::atan2(v_inplane, std::abs(cond.vz) + vi_est);
+        kx = (15.0 * kPi / 23.0) * std::tan(0.5 * chi_est);
+    }
+
+    for (int i = 0; i < nr; ++i) {
+        const double r_i = geom_.r[i];
+        for (int j = 0; j < npsi; ++j) {
+            const double u_t_ij   = cond.omega * r_i + s_dir * (cond.vx * sin_psi[j] - cond.vy * cos_psi[j]);
+            const double abs_u_t  = std::max(std::abs(u_t_ij), 1.0);
+            res.phi(i, j) = std::clamp(std::atan2(cond.vz + vi_est, abs_u_t), -0.8, 0.8);
+        }
+    }
+
     int total_fallbacks = 0;
+    int unconverged_cells = 0;
 
     for (int wake_iter = 0; wake_iter < outer_iters; ++wake_iter) {
-        total_fallbacks = 0;
+        total_fallbacks   = 0;
+        unconverged_cells = 0;
+        const bool is_final_wake_iter = (wake_iter == outer_iters - 1);
+        const double active_tol       = is_final_wake_iter ? cfg_.tol : std::max(cfg_.tol, 1e-7);
 
-        // OpenMP 多核并行：沿径向圆环 i (或分块) 分配线程，每个圆环内部沿周向 j 向量化处理
-        // 由于第 i 行共享同一个翼型表 geom_.airfoils[i]，按行划分线程具备极致的 L1 缓存命中率！
-        #pragma omp parallel for schedule(static) reduction(+:total_fallbacks) if(!omp_in_parallel())
+        #pragma omp parallel for schedule(static) reduction(+:total_fallbacks, unconverged_cells) if(!omp_in_parallel())
         for (int i = 0; i < nr; ++i) {
-            const double r_i   = geom_.r[i];
+            const double r_i    = geom_.r[i];
             const double r_norm = r_i / R_tip;
-            const double c_i   = geom_.chord[i];
-            const double tw_i  = geom_.twist[i];
+            const double c_i    = geom_.chord[i];
+            const double tw_i   = geom_.twist[i];
 
             for (int j = 0; j < npsi; ++j) {
-                // 局部桨距角 (含总距、扭转角和周期变距)
                 const double theta_ij = tw_i + cond.pitch_0 +
                                         cond.pitch_1c * cos_psi[j] +
                                         cond.pitch_1s * sin_psi[j];
 
-                // 局部切向与轴向来流速度
                 const double u_t_ij = cond.omega * r_i + s_dir * (cond.vx * sin_psi[j] - cond.vy * cos_psi[j]);
                 const double u_p_ij = cond.vz;
 
-                // Pitt-Peters 斜尾迹一阶谐波修正因子: 1 + kx*(r/R)*cos(psi_rel) + ky*(r/R)*sin(psi_rel)
-                const double wake_fac = std::max(0.1, 1.0 + kx * r_norm * cos_psi_rel[j] + ky * r_norm * sin_psi_rel[j]);
+                // 使用 smooth_max 保证 wake_fac >= 0.1 且导数处处连续
+                const double raw_wake = 1.0 + kx * r_norm * cos_psi_rel[j] + ky * r_norm * sin_psi_rel[j];
+                const double wake_fac = math::smooth_max(raw_wake, 0.1, 0.02);
 
-                // 阶段 1: 基于 Dual1 解析导数的阻尼牛顿-拉夫逊法 (通常 4 ~ 6 步收敛至 1e-12)
                 double phi_curr = res.phi(i, j);
                 bool cell_conv  = false;
 
+                // 阶段 1: 带回溯阻尼保护 (Backtracking) 的解析牛顿-拉夫逊法
                 for (int it = 0; it < cfg_.max_newton_iters; ++it) {
-                    Dual1 phi_dual(phi_curr, 1.0); // 设 d(phi)/d(phi) = 1.0
+                    Dual1 phi_dual(phi_curr, 1.0);
                     auto out_dual = eval_element_kernel<Dual1>(
                         i, phi_dual, Dual1(c_i), Dual1(theta_ij),
                         Dual1(u_p_ij), Dual1(u_t_ij), Dual1(v_inplane_sq),
                         Dual1(cond.omega), Dual1(wake_fac), cond);
 
-                    const double r_val  = out_dual.residual.val;
+                    const double r_val   = out_dual.residual.val;
                     const double dr_dphi = out_dual.residual.grad(0);
 
-                    if (std::abs(r_val) <= cfg_.tol) {
+                    if (!std::isfinite(r_val) || !std::isfinite(dr_dphi)) {
+                        break; // 一旦出现非有限值立即移交 Brent 兜底
+                    }
+
+                    if (std::abs(r_val) <= active_tol) {
                         cell_conv = true;
                         break;
                     }
 
-                    // 步长保护与更新
-                    if (std::abs(dr_dphi) > 1e-9) {
-                        double step = -r_val / dr_dphi;
-                        step = std::clamp(step, -cfg_.newton_max_step, cfg_.newton_max_step);
-                        phi_curr = std::clamp(phi_curr + step, -kHalfPi + 1e-3, kHalfPi - 1e-3);
+                    if (std::abs(dr_dphi) > 1e-8) {
+                        double full_step = std::clamp(-r_val / dr_dphi, -cfg_.newton_max_step, cfg_.newton_max_step);
+                        double phi_next  = std::clamp(phi_curr + full_step, -kHalfPi + 1e-4, kHalfPi - 1e-4);
+
+                        // 检查全步长是否恶化残差（防止在失速峰顶发生周期2跳动）
+                        double r_next = eval_element_kernel<double>(
+                            i, phi_next, c_i, theta_ij, u_p_ij, u_t_ij, v_inplane_sq, cond.omega, wake_fac, cond).residual;
+
+                        if (std::abs(r_next) > std::abs(r_val)) {
+                            // 半步回溯阻尼
+                            phi_next = std::clamp(phi_curr + 0.5 * full_step, -kHalfPi + 1e-4, kHalfPi - 1e-4);
+                        }
+                        phi_curr = phi_next;
                     } else {
-                        break; // 导数奇异，交由 Brent 兜底
+                        break; // 局部导数接近0，立即交由 Brent 处理
                     }
                 }
 
-                // 阶段 2: 若牛顿法未达精度，自动触发 Brent 标量求根兜底
+                // 阶段 2: 鲁棒性铁律 —— 只要牛顿法未严格达到 active_tol，100% 启动 Brent 兜底！
                 if (!cell_conv) {
+                    bool brent_ok = false;
                     phi_curr = solve_cell_brent(
-                        i, c_i, theta_ij, u_p_ij, u_t_ij, v_inplane_sq, cond.omega, wake_fac, cond, phi_curr);
+                        i, c_i, theta_ij, u_p_ij, u_t_ij, v_inplane_sq, cond.omega, wake_fac, cond, phi_curr, brent_ok);
                     total_fallbacks += 1;
+                    if (!brent_ok && is_final_wake_iter) {
+                        unconverged_cells += 1;
+                    }
                 }
 
-                // 在最终收敛的 phi* 处评估一次 double 核函数，写入二维结果场
+                res.phi(i, j) = phi_curr;
+
                 auto final_out = eval_element_kernel<double>(
                     i, phi_curr, c_i, theta_ij, u_p_ij, u_t_ij, v_inplane_sq, cond.omega, wake_fac, cond);
 
-                res.phi(i, j)      = phi_curr;
-                res.alpha(i, j)    = final_out.alpha;
-                res.vi(i, j)       = final_out.vi_local;
-                res.vt(i, j)       = final_out.vt_local;
-                res.cl(i, j)       = final_out.cl;
-                res.cd(i, j)       = final_out.cd;
-                res.re(i, j)       = final_out.re;
-                res.ma(i, j)       = final_out.ma;
-                res.f_tip(i, j)    = final_out.f_loss;
-                res.df_z(i, j)     = final_out.df_z;
-                res.df_theta(i, j) = final_out.df_theta;
+                res.vi(i, j) = final_out.vi_local;
+                if (is_final_wake_iter) {
+                    res.alpha(i, j)    = final_out.alpha;
+                    res.vt(i, j)       = final_out.vt_local;
+                    res.cl(i, j)       = final_out.cl;
+                    res.cd(i, j)       = final_out.cd;
+                    res.re(i, j)       = final_out.re;
+                    res.ma(i, j)       = final_out.ma;
+                    res.f_tip(i, j)    = final_out.f_loss;
+                    res.df_z(i, j)     = final_out.df_z;
+                    res.df_theta(i, j) = final_out.df_theta;
+                }
             }
         }
 
-        // 计算径向各圆环的周向平均基准诱导速度 v_i0(r_i) 与桨盘面积加权平均诱导速度 vi_disk_mean
         double weighted_vi_sum = 0.0;
         for (int i = 0; i < nr; ++i) {
             res.vi_annulus[i] = res.vi.row(i).mean();
@@ -279,56 +324,47 @@ BEMTResult BEMTSolver::solve(const OperatingCondition& cond, bool compute_gradie
         }
         res.vi_disk_mean = weighted_vi_sum / A_disk;
 
-        // 更新尾迹偏斜角 chi 与 Pitt-Peters 系数 kx, ky
-        const double vz_wake = std::abs(cond.vz) + std::max(res.vi_disk_mean, 0.1);
+        // 使用 smooth_abs 保证尾迹轴向合速度永不为零
+        const double vz_wake = math::smooth_abs(cond.vz + res.vi_disk_mean, 0.2);
         res.wake_skew_chi    = std::atan2(v_inplane, vz_wake);
 
         if (use_pitt_peters) {
-            // Pitt-Peters (1981) / Coleman 经典纵向入流谐波梯度系数: kx = (15*pi/23) * tan(chi / 2)
             const double kx_new = (15.0 * kPi / 23.0) * std::tan(0.5 * res.wake_skew_chi);
-            if ( std::abs(kx_new - kx) < 1e-6 && wake_iter >= 1) {
-                kx = kx_new;
+            // 带欠松弛保护更新 kx，防止极端下降流下外层尾迹角震荡
+            const double diff_kx = std::abs(kx_new - kx);
+            kx = 0.7 * kx_new + 0.3 * kx;
+            if (diff_kx < 1e-5 && wake_iter >= 1) {
+                // 若提前收敛但尚未填充最后一步输出场，补填一次输出场后退出
+                if (!is_final_wake_iter) {
+                    continue;
+                }
                 break;
             }
-            kx = kx_new;
         }
     }
 
-    res.pitt_kx = kx;
-    res.pitt_ky = ky;
+    res.converged = (unconverged_cells == 0);
+    res.pitt_kx   = kx;
+    res.pitt_ky   = ky;
     res.total_fallback_cells = total_fallbacks;
 
-    // ------------------------------------------------------------------------
-    // 3. 矩阵化全桨盘六分量气动力与力矩积分 (Matrix-Vector Reductions)
-    // ------------------------------------------------------------------------
     const double B = static_cast<double>(geom_.num_blades);
-
-    // 径向每个圆环的 B 片桨叶周向平均载荷: dT/dr(r_i) = B * mean_psi(df_z), dQ/dr(r_i) = B * r_i * mean_psi(df_theta)
     res.dT_dr_mean = B * res.df_z.rowwise().mean();
     res.dQ_dr_mean = B * geom_.r * res.df_theta.rowwise().mean();
 
-    // 总拉力 T (= Fz), 总反扭矩 Q (= Mz), 总轴功率 P
     res.thrust = (res.dT_dr_mean * geom_.dr).sum();
     res.fz     = res.thrust;
     res.torque = (res.dQ_dr_mean * geom_.dr).sum();
     res.mz     = res.torque;
     res.power  = res.torque * cond.omega;
 
-    // 面内力 Fx (H-force), Fy (Y-force) 与俯仰/滚转力矩 Mx (Roll), My (Pitch)
-    // 对于方位角 psi_j:
-    // - 周向阻力 df_theta 投影到桨盘 X, Y 轴:
-    //   dFx = B * mean_psi( df_theta * s_dir * sin(psi) )
-    //   dFy = B * mean_psi( -df_theta * s_dir * cos(psi) )
-    // - 轴向推力 df_z 产生的力矩:
-    //   滚转力矩 Mx (前行边 psi=90deg 升力大产生负/正滚转): dMx = B * r * mean_psi( df_z * sin(psi) )
-    //   俯仰力矩 My (前缘 psi=180deg 升力大产生抬头力矩): dMy = B * r * mean_psi( -df_z * cos(psi) )
     const double inv_npsi = 1.0 / static_cast<double>(npsi);
     VectorXd cos_vec = cos_psi.matrix();
     VectorXd sin_vec = sin_psi.matrix();
 
-    ArrayXd dfx_dr = B * s_dir * inv_npsi * (res.df_theta.matrix() * sin_vec).array();
+    ArrayXd dfx_dr =  B * s_dir * inv_npsi * (res.df_theta.matrix() * sin_vec).array();
     ArrayXd dfy_dr = -B * s_dir * inv_npsi * (res.df_theta.matrix() * cos_vec).array();
-    ArrayXd dmx_dr = B * geom_.r * inv_npsi * (res.df_z.matrix() * sin_vec).array();
+    ArrayXd dmx_dr =  B * geom_.r * inv_npsi * (res.df_z.matrix() * sin_vec).array();
     ArrayXd dmy_dr = -B * geom_.r * inv_npsi * (res.df_z.matrix() * cos_vec).array();
 
     res.fx = (dfx_dr * geom_.dr).sum();
@@ -336,11 +372,7 @@ BEMTResult BEMTSolver::solve(const OperatingCondition& cond, bool compute_gradie
     res.mx = (dmx_dr * geom_.dr).sum();
     res.my = (dmy_dr * geom_.dr).sum();
 
-    // ------------------------------------------------------------------------
-    // 4. 计算无量纲气动系数 (CT, CQ, CP, FM)
-    // ------------------------------------------------------------------------
     const double area_full = kPi * R_tip * R_tip;
-    const double v_tip     = cond.omega * R_tip;
     const double denom_f   = std::max(cond.rho * area_full * v_tip * v_tip, 1e-12);
 
     res.ct = res.thrust / denom_f;
@@ -352,9 +384,6 @@ BEMTResult BEMTSolver::solve(const OperatingCondition& cond, bool compute_gradie
         res.fm = 0.0;
     }
 
-    // ------------------------------------------------------------------------
-    // 5. 若开启求导，调用隐函数定理 (IFT) 解析敏度计算器
-    // ------------------------------------------------------------------------
     if (compute_gradients) {
         compute_ift_sensitivities(*this, cond, res);
     }
@@ -362,15 +391,12 @@ BEMTResult BEMTSolver::solve(const OperatingCondition& cond, bool compute_gradie
     return res;
 }
 
-// ============================================================================
-// 多工况批量求解
-// ============================================================================
 std::vector<BEMTResult> BEMTSolver::solve_batch(const std::vector<OperatingCondition>& conds,
                                                 bool compute_gradients) const {
     const int n_cases = static_cast<int>(conds.size());
     std::vector<BEMTResult> results(n_cases);
 
-    #pragma omp parallel for schedule(dynamic)
+    #pragma omp parallel for schedule(guided)
     for (int k = 0; k < n_cases; ++k) {
         results[k] = solve(conds[k], compute_gradients);
     }

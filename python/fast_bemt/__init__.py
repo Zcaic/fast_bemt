@@ -19,6 +19,8 @@ from ._fast_bemt_impl import (
     BEMTSensitivity,
     BEMTResult,
     BEMTSolver,
+    set_num_threads,
+    get_max_threads
 )
 
 
@@ -70,4 +72,6 @@ __all__ = [
     "BEMTResult",
     "BEMTSolver",
     "create_3d_airfoil",
+    "set_num_threads",
+    "get_max_threads"
 ]

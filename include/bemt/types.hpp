@@ -95,6 +95,20 @@ inline Scalar sigmoid_weight(const Scalar& x, double x0, double width) {
     return Scalar(1.0) / (Scalar(1.0) + exp(-z));
 }
 
+// 将任意角度 x [rad] 包裹到 [-pi, pi] 区间内，且保持对自变量的导数恒为 1.0
+template <typename Scalar>
+inline Scalar wrap_to_pi(const Scalar& x) {
+    double xv = 0.0;
+    if constexpr (std::is_same_v<Scalar, double>) {
+        xv = x;
+    } else {
+        xv = x.val;
+    }
+    const double wrapped_val = std:: remainder(xv, kTwoPi);
+    // x - xv 仅保留 Dual 的导数部分 d，实部替换为 wrapped_val
+    return (x - Scalar(xv)) + Scalar(wrapped_val);
+}
+
 } // namespace math
 
 } // namespace bemt

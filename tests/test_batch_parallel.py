@@ -7,6 +7,9 @@ import numpy as np
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "python")))
 import fast_bemt as fb
 
+print(fb.get_max_threads())
+# print(fb.set_num_threads(1))
+
 
 def create_test_rotor(n_r: int = 20) -> fb.RotorGeometry:
     """构建 20 径向站位 + 20 独立三维翼型表的测试旋翼"""
