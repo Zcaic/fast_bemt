@@ -3,15 +3,9 @@ import os
 import sys
 import numpy as np
 
-# 若使用 cmake --build build 直接在本地编译，自动将 build 目录加入搜索路径以便直接导入调试
-# _pkg_dir = os.path.dirname(os.path.abspath(__file__))
-# _root_dir = os.path.abspath(os.path.join(_pkg_dir, "..", ".."))
-# _build_dir = os.path.join(_root_dir, "build")
-# if os.path.isdir(_build_dir) and _build_dir not in sys.path:
-#     sys.path.insert(0, _build_dir)
-
 from ._fast_bemt_impl import (
     WakeModel,
+    BSplineCurve,
     Airfoil3D,
     RotorGeometry,
     OperatingCondition,
@@ -19,8 +13,32 @@ from ._fast_bemt_impl import (
     BEMTSensitivity,
     BEMTResult,
     BEMTSolver,
+    build_clamped_uniform_knots,
+    build_greville_abscissae,
+    build_bspline_basis_matrix,
+    build_parametric_bspline_basis_matrix,
     set_num_threads,
-    get_max_threads
+    get_max_threads,
+)
+
+from .optimization import (
+    KulfanCSTAirfoil,
+    create_airfoil_from_neuralfoil,
+    create_section_airfoils_from_neuralfoil,
+    build_spanwise_section_weight_matrix,
+    compute_element_polar_sensitivities,
+    compute_cst_aerodynamic_gradients,
+    build_planform_and_twist_distribution_constraints,
+    BladeOptimizationResult,
+    RotorBladeOptimizer,
+    HoverCruiseOptimizationResult,
+    HoverCruiseBladeOptimizer,
+    OperatingPointSpec,
+    ObjectiveTermSpec,
+    MetricConstraintSpec,
+    MultiPointOptimizationResult,
+    MultiPointBladeOptimizer,
+    BEMTRotorComp,
 )
 
 
@@ -64,6 +82,7 @@ def create_3d_airfoil(
 
 __all__ = [
     "WakeModel",
+    "BSplineCurve",
     "Airfoil3D",
     "RotorGeometry",
     "OperatingCondition",
@@ -71,7 +90,28 @@ __all__ = [
     "BEMTSensitivity",
     "BEMTResult",
     "BEMTSolver",
+    "KulfanCSTAirfoil",
     "create_3d_airfoil",
+    "create_airfoil_from_neuralfoil",
+    "create_section_airfoils_from_neuralfoil",
+    "build_spanwise_section_weight_matrix",
+    "compute_element_polar_sensitivities",
+    "compute_cst_aerodynamic_gradients",
+    "build_planform_and_twist_distribution_constraints",
+    "BladeOptimizationResult",
+    "RotorBladeOptimizer",
+    "HoverCruiseOptimizationResult",
+    "HoverCruiseBladeOptimizer",
+    "OperatingPointSpec",
+    "ObjectiveTermSpec",
+    "MetricConstraintSpec",
+    "MultiPointOptimizationResult",
+    "MultiPointBladeOptimizer",
+    "BEMTRotorComp",
+    "build_clamped_uniform_knots",
+    "build_greville_abscissae",
+    "build_bspline_basis_matrix",
+    "build_parametric_bspline_basis_matrix",
     "set_num_threads",
-    "get_max_threads"
+    "get_max_threads",
 ]

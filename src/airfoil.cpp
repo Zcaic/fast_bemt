@@ -1,4 +1,5 @@
 #include "bemt/airfoil.hpp"
+#include <algorithm>
 #include <cmath>
 
 namespace bemt {
@@ -59,6 +60,37 @@ void compute_monotone_slopes(const ArrayXd& x, const ArrayXd& y, ArrayXd& d) {
     d[n - 1] = dn;
 }
 
+bool grids_match(const ArrayXd& a, const ArrayXd& b, double tol = 1e-11) {
+    if (a.size() != b.size()) return false;
+    for (Eigen::Index i = 0; i < a.size(); ++i) {
+        if (std::abs(a[i] - b[i]) > tol * std::max(1.0, std::abs(a[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+ArrayXd merge_sorted_grids(const ArrayXd& a, const ArrayXd& b, double tol = 1e-8) {
+    std::vector<double> merged;
+    merged.reserve(static_cast<size_t>(a.size() + b.size()));
+    for (Eigen::Index i = 0; i < a.size(); ++i) merged.push_back(a[i]);
+    for (Eigen::Index i = 0; i < b.size(); ++i) merged.push_back(b[i]);
+    std::sort(merged.begin(), merged.end());
+
+    std::vector<double> unique_vals;
+    unique_vals.reserve(merged.size());
+    for (double v : merged) {
+        if (unique_vals.empty() || (v - unique_vals.back()) > tol * std::max(1.0, std::abs(v))) {
+            unique_vals.push_back(v);
+        }
+    }
+    ArrayXd out(static_cast<Eigen::Index>(unique_vals.size()));
+    for (size_t i = 0; i < unique_vals.size(); ++i) {
+        out[static_cast<Eigen::Index>(i)] = unique_vals[i];
+    }
+    return out;
+}
+
 } // namespace
 
 // ============================================================================
@@ -90,13 +122,31 @@ Airfoil3D::Airfoil3D(const ConstRefArrayXd& alpha_grid,
         throw std::invalid_argument("Airfoil3D: cl_table and cd_table size must equal N_a * N_re * N_ma.");
     }
 
-    // 转换 Re 网格到 log10(Re)
+    for (int i = 0; i < n_a_ - 1; ++i) {
+        if (alpha_grid_[i + 1] <= alpha_grid_[i]) {
+            throw std::invalid_argument("Airfoil3D: alpha_grid must be strictly increasing.");
+        }
+    }
+
+    // 转换 Re 网格到 log10(Re) 并校验严格递增
     log_re_grid_.resize(n_re_);
     for (int i = 0; i < n_re_; ++i) {
         if (re_grid[i] <= 0.0) {
             throw std::invalid_argument("Airfoil3D: Reynolds numbers in re_grid must be strictly positive.");
         }
+        if (i > 0 && re_grid[i] <= re_grid[i - 1]) {
+            throw std::invalid_argument("Airfoil3D: re_grid must be strictly increasing.");
+        }
         log_re_grid_[i] = std::log10(re_grid[i]);
+    }
+
+    if (ma_grid_[0] < 0.0) {
+        throw std::invalid_argument("Airfoil3D: Mach numbers in ma_grid must be >= 0.");
+    }
+    for (int i = 0; i < n_ma_ - 1; ++i) {
+        if (ma_grid_[i + 1] <= ma_grid_[i]) {
+            throw std::invalid_argument("Airfoil3D: ma_grid must be strictly increasing.");
+        }
     }
 
     // Viterna-Corrigan 最大平板阻力系数经验公式
@@ -117,6 +167,130 @@ Airfoil3D Airfoil3D::from_1d_polar(const ConstRefArrayXd& alpha_grid,
     ArrayXd ma_grid(1);
     ma_grid[0] = 0.0;
     return Airfoil3D(alpha_grid, re_grid, ma_grid, cl_1d, cd_1d, aspect_ratio, enable_extrapolation);
+}
+
+std::shared_ptr<const Airfoil3D> Airfoil3D::interpolate_section(
+    const std::shared_ptr<const Airfoil3D>& af0,
+    const std::shared_ptr<const Airfoil3D>& af1,
+    double weight) {
+    if (!af0 || !af1) {
+        throw std::invalid_argument("Airfoil3D::interpolate_section: input airfoil pointers must not be null.");
+    }
+    const double w = std::clamp(weight, 0.0, 1.0);
+    if (w <= 1e-12 || af0.get() == af1.get()) {
+        return af0;
+    }
+    if (w >= 1.0 - 1e-12) {
+        return af1;
+    }
+
+    const double w0 = 1.0 - w;
+    const double w1 = w;
+
+    // 快速通道：当两截面翼型的 (alpha, Re, Ma) 网格一致时，直接线性融合 Hermite 导数表 (O(1) 零损耗)
+    if (grids_match(af0->alpha_grid_, af1->alpha_grid_) &&
+        grids_match(af0->log_re_grid_, af1->log_re_grid_) &&
+        grids_match(af0->ma_grid_, af1->ma_grid_)) {
+        auto blended = std::make_shared<Airfoil3D>(*af0);
+        const size_t total = blended->cl_jets_.size();
+        for (size_t k = 0; k < total; ++k) {
+            blended->cl_jets_[k].f    = w0 * af0->cl_jets_[k].f    + w1 * af1->cl_jets_[k].f;
+            blended->cl_jets_[k].fa   = w0 * af0->cl_jets_[k].fa   + w1 * af1->cl_jets_[k].fa;
+            blended->cl_jets_[k].flre = w0 * af0->cl_jets_[k].flre + w1 * af1->cl_jets_[k].flre;
+            blended->cl_jets_[k].fma  = w0 * af0->cl_jets_[k].fma  + w1 * af1->cl_jets_[k].fma;
+
+            blended->cd_jets_[k].f    = w0 * af0->cd_jets_[k].f    + w1 * af1->cd_jets_[k].f;
+            blended->cd_jets_[k].fa   = w0 * af0->cd_jets_[k].fa   + w1 * af1->cd_jets_[k].fa;
+            blended->cd_jets_[k].flre = w0 * af0->cd_jets_[k].flre + w1 * af1->cd_jets_[k].flre;
+            blended->cd_jets_[k].fma  = w0 * af0->cd_jets_[k].fma  + w1 * af1->cd_jets_[k].fma;
+        }
+        blended->aspect_ratio_         = w0 * af0->aspect_ratio_    + w1 * af1->aspect_ratio_;
+        blended->cd_max_               = w0 * af0->cd_max_          + w1 * af1->cd_max_;
+        blended->alpha_zero_lift_      = w0 * af0->alpha_zero_lift_ + w1 * af1->alpha_zero_lift_;
+        blended->cl_slope_linear_      = w0 * af0->cl_slope_linear_ + w1 * af1->cl_slope_linear_;
+        blended->enable_extrapolation_ = af0->enable_extrapolation_ || af1->enable_extrapolation_;
+        return blended;
+    }
+
+    // 通用通道：若两截面翼型网格不同，在合并网格上重采样并构造融合后的 Airfoil3D
+    ArrayXd a_merged   = merge_sorted_grids(af0->alpha_grid_, af1->alpha_grid_);
+    ArrayXd lre_merged = merge_sorted_grids(af0->log_re_grid_, af1->log_re_grid_);
+    ArrayXd ma_merged  = merge_sorted_grids(af0->ma_grid_, af1->ma_grid_);
+
+    const int na  = static_cast<int>(a_merged.size());
+    const int nre = static_cast<int>(lre_merged.size());
+    const int nma = static_cast<int>(ma_merged.size());
+
+    ArrayXd re_merged(nre);
+    for (int ire = 0; ire < nre; ++ire) {
+        re_merged[ire] = std::pow(10.0, lre_merged[ire]);
+    }
+
+    ArrayXd cl_tbl(na * nre * nma);
+    ArrayXd cd_tbl(na * nre * nma);
+    for (int ia = 0; ia < na; ++ia) {
+        for (int ire = 0; ire < nre; ++ire) {
+            for (int ima = 0; ima < nma; ++ima) {
+                const int k = (ia * nre + ire) * nma + ima;
+                auto [cl0, cd0] = af0->eval<double>(a_merged[ia], re_merged[ire], ma_merged[ima]);
+                auto [cl1, cd1] = af1->eval<double>(a_merged[ia], re_merged[ire], ma_merged[ima]);
+                cl_tbl[k] = w0 * cl0 + w1 * cl1;
+                cd_tbl[k] = w0 * cd0 + w1 * cd1;
+            }
+        }
+    }
+
+    const double ar_blend   = w0 * af0->aspect_ratio_ + w1 * af1->aspect_ratio_;
+    const bool extrap_blend = af0->enable_extrapolation_ || af1->enable_extrapolation_;
+    return std::make_shared<Airfoil3D>(a_merged, re_merged, ma_merged, cl_tbl, cd_tbl, ar_blend, extrap_blend);
+}
+
+std::vector<std::shared_ptr<const Airfoil3D>> Airfoil3D::interpolate_spanwise_sections(
+    const ConstRefArrayXd& section_r_norm,
+    const std::vector<std::shared_ptr<const Airfoil3D>>& section_airfoils,
+    const ConstRefArrayXd& target_r_norm) {
+    const int m_sec = static_cast<int>(section_r_norm.size());
+    if (m_sec < 1) {
+        throw std::invalid_argument("Airfoil3D::interpolate_spanwise_sections: section_r_norm must contain at least 1 section.");
+    }
+    if (static_cast<int>(section_airfoils.size()) != m_sec) {
+        throw std::invalid_argument("Airfoil3D::interpolate_spanwise_sections: section_r_norm and section_airfoils must have the same size.");
+    }
+    for (int m = 0; m < m_sec; ++m) {
+        if (!section_airfoils[m]) {
+            throw std::invalid_argument("Airfoil3D::interpolate_spanwise_sections: section_airfoils contains null pointer at index " + std::to_string(m));
+        }
+        if (m > 0 && section_r_norm[m] <= section_r_norm[m - 1]) {
+            throw std::invalid_argument("Airfoil3D::interpolate_spanwise_sections: section_r_norm must be strictly increasing.");
+        }
+    }
+
+    const int n_target = static_cast<int>(target_r_norm.size());
+    std::vector<std::shared_ptr<const Airfoil3D>> out(n_target);
+
+    if (m_sec == 1) {
+        for (int i = 0; i < n_target; ++i) {
+            out[i] = section_airfoils[0];
+        }
+        return out;
+    }
+
+    for (int i = 0; i < n_target; ++i) {
+        const double x = target_r_norm[i];
+        if (x <= section_r_norm[0]) {
+            out[i] = section_airfoils[0];
+        } else if (x >= section_r_norm[m_sec - 1]) {
+            out[i] = section_airfoils[m_sec - 1];
+        } else {
+            auto it = std::upper_bound(section_r_norm.data(), section_r_norm.data() + m_sec, x);
+            const int idx_left = std::clamp(static_cast<int>(it - section_r_norm.data()) - 1, 0, m_sec - 2);
+            const double x0 = section_r_norm[idx_left];
+            const double x1 = section_r_norm[idx_left + 1];
+            const double w  = (x - x0) / std::max(x1 - x0, 1e-12);
+            out[i] = interpolate_section(section_airfoils[idx_left], section_airfoils[idx_left + 1], w);
+        }
+    }
+    return out;
 }
 
 void Airfoil3D::build_hermite_jets(const ConstRefArrayXd& cl_raw, const ConstRefArrayXd& cd_raw) {
@@ -205,7 +379,6 @@ void Airfoil3D::build_hermite_jets(const ConstRefArrayXd& cl_raw, const ConstRef
     const int mid_re = n_re_ / 2;
     const int low_ma = 0;
 
-    // 寻找 alpha = 0 附近的斜率与零升迎角
     int ia_zero = 0;
     double min_abs_a = 1e9;
     for (int ia = 0; ia < n_a_; ++ia) {

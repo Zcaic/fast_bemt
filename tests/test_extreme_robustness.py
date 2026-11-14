@@ -1,23 +1,23 @@
+import os
+import sys
 import time
 import numpy as np
-import os 
-import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "python")))
 import fast_bemt as fb
 
 
-def build_base_airfoils(n_r: int = 20) -> list[fb.Airfoil3D]:
-    """生成 20 个径向站位的三维翼型插值表，网格范围仅为常规的 [-18 deg, +18 deg]"""
+def build_five_section_airfoils() -> tuple[np.ndarray, list[fb.Airfoil3D]]:
+    """生成 5 个展向控制截面 (r/R = [0.1, 0.2, 0.5, 0.75, 1.0]) 的三维翼型插值表"""
+    section_r_norm = np.array([0.10, 0.20, 0.50, 0.75, 1.00])
     alpha_grid = np.deg2rad(np.linspace(-18.0, 18.0, 73))
     re_grid = np.array([5.0e4, 5.0e5, 2.0e6, 5.0e6])
     ma_grid = np.array([0.0, 0.3, 0.6, 0.85])
     A, RE, MA = np.meshgrid(alpha_grid, re_grid, ma_grid, indexing="ij")
 
     airfoils = []
-    for i in range(n_r):
-        span_frac = i / (n_r - 1)
-        alpha_0 = np.deg2rad(-2.0 * (1.0 - 0.5 * span_frac))
+    for r_sec in section_r_norm:
+        alpha_0 = np.deg2rad(-2.0 * (1.0 - 0.5 * r_sec))
         pg_factor = 1.0 / np.sqrt(1.0 - (0.75 * MA) ** 2)
         re_scale = (RE / 1.0e6) ** (-0.08)
 
@@ -25,28 +25,40 @@ def build_base_airfoils(n_r: int = 20) -> list[fb.Airfoil3D]:
         cl_linear = 2.0 * np.pi * a_eff * pg_factor
         stall_blend = 1.0 / (1.0 + (a_eff / np.deg2rad(14.0)) ** 6)
         cl_3d = cl_linear * stall_blend + 1.05 * np.sin(2.0 * a_eff) * (1.0 - stall_blend)
-        cd_min = (0.0085 - 0.002 * span_frac) * re_scale
+        cd_min = (0.0085 - 0.002 * r_sec) * re_scale
         cd_3d = cd_min + 0.025 * (a_eff / np.deg2rad(10.0)) ** 2 + 0.05 * (MA**3)
 
         airfoils.append(fb.create_3d_airfoil(alpha_grid, re_grid, ma_grid, cl_3d, cd_3d))
-    return airfoils
+    return section_r_norm, airfoils
 
 
-def build_standard_rotor(airfoils: list[fb.Airfoil3D]) -> fb.RotorGeometry:
-    n_r = len(airfoils)
+def build_standard_rotor(
+    section_r_norm: np.ndarray,
+    section_airfoils: list[fb.Airfoil3D],
+    n_radial: int = 20,
+    n_ctrl: int = 6,
+    bspline_degree: int = 3,
+) -> fb.RotorGeometry:
     radius = 1.25
     hub_radius = 0.15
-    edges = np.linspace(hub_radius, radius, n_r + 1)
-    r = 0.5 * (edges[:-1] + edges[1:])
-    dr = np.diff(edges)
-    r_norm = r / radius
-    chord = 0.10 * (1.0 - 0.35 * r_norm**2)
-    twist = np.deg2rad(28.0 * (1.0 - r_norm) + 4.0)
-    return fb.RotorGeometry(3, radius, hub_radius, r, chord, twist, airfoils, 1, dr)
+    x_ctrl = np.linspace(hub_radius / radius, 1.0, n_ctrl)
+    chord_curve = fb.BSplineCurve(x_ctrl, 0.10 * (1.0 - 0.35 * x_ctrl**2), degree=bspline_degree)
+    twist_curve = fb.BSplineCurve(x_ctrl, np.deg2rad(28.0 * (1.0 - x_ctrl) + 4.0), degree=bspline_degree)
+    return fb.RotorGeometry(
+        num_blades=3,
+        radius=radius,
+        hub_radius=hub_radius,
+        n_radial=n_radial,
+        chord_curve=chord_curve,
+        twist_curve=twist_curve,
+        airfoils=section_airfoils,
+        section_r_norm=section_r_norm,
+        spin_dir=1,
+    )
 
 
 def assert_result_all_finite(res: fb.BEMTResult, case_name: str, check_grad: bool = True):
-    """严格断言求解结果中的所有标量、2D 场矩阵和全部解析梯度均无 NaN 或 Inf"""
+    """严格断言求解结果中的所有标量、2D 场矩阵和全部 B 样条控制点/站位解析梯度均无 NaN 或 Inf"""
     scalars = [
         res.thrust, res.torque, res.power,
         res.fx, res.fy, res.fz,
@@ -71,11 +83,15 @@ def assert_result_all_finite(res: fb.BEMTResult, case_name: str, check_grad: boo
         if not s.valid:
             raise AssertionError(f"[{case_name}] 敏度结构体未标记为 valid!")
         grad_arrays = [
-            s.dT_dchord, s.dT_dtwist,
-            s.dQ_dchord, s.dQ_dtwist,
-            s.dP_dchord, s.dP_dtwist,
-            s.dMx_dchord, s.dMx_dtwist,
-            s.dMy_dchord, s.dMy_dtwist,
+            s.dT_dchord_ctrl, s.dT_dtwist_ctrl,
+            s.dQ_dchord_ctrl, s.dQ_dtwist_ctrl,
+            s.dP_dchord_ctrl, s.dP_dtwist_ctrl,
+            s.dFx_dchord_ctrl, s.dFx_dtwist_ctrl,
+            s.dFy_dchord_ctrl, s.dFy_dtwist_ctrl,
+            s.dMx_dchord_ctrl, s.dMx_dtwist_ctrl,
+            s.dMy_dchord_ctrl, s.dMy_dtwist_ctrl,
+            s.dT_dchord_ctrl_r, s.dT_dtwist_ctrl_r,
+            s.dQ_dchord_ctrl_r, s.dQ_dtwist_ctrl_r,
             s.dForces_dCond,
             s.dTr_dchord_diag, s.dTr_dtwist_diag,
         ]
@@ -86,11 +102,11 @@ def assert_result_all_finite(res: fb.BEMTResult, case_name: str, check_grad: boo
 
 def run_extreme_stress_tests():
     print("=" * 82)
-    print("FAST_BEMT 极端恶劣工况与病态几何鲁棒性压力测试 (Robustness Stress Suite)")
+    print("FAST_BEMT 极端恶劣工况与病态 BSplineCurve 控制点几何鲁棒性压力测试 (Robustness Stress Suite)")
     print("=" * 82)
 
-    airfoils = build_base_airfoils(20)
-    geom = build_standard_rotor(airfoils)
+    section_r_norm, section_airfoils = build_five_section_airfoils()
+    geom = build_standard_rotor(section_r_norm, section_airfoils, n_radial=20, n_ctrl=6, bspline_degree=3)
     cfg = fb.SolverConfig(
         n_azimuth=36,
         wake_model=fb.WakeModel.GlauertPittPeters,
@@ -102,7 +118,7 @@ def run_extreme_stress_tests():
     solver = fb.BEMTSolver(geom, cfg)
 
     # =========================================================================
-    # 测试 1：6 类典型极限物理工况测试（验证流场与梯度无 NaN/Inf）
+    # 测试 1：6 类典型极限物理工况测试
     # =========================================================================
     extreme_cases = [
         (
@@ -145,13 +161,13 @@ def run_extreme_stress_tests():
             f"         -> Conv={res.converged}, Fallback={res.total_fallback_cells:3d}/720 | "
             f"T={res.thrust:8.1f} N, Q={res.torque:7.1f} N·m | "
             f"迎角范围=[{alpha_min_deg:6.1f}°, {alpha_max_deg:6.1f}°] | "
-            f"||dT/dtwist||={np.linalg.norm(res.sensitivity.dT_dtwist):.2e}"
+            f"||dT/dtwist_ctrl||={np.linalg.norm(res.sensitivity.dT_dtwist_ctrl):.2e}"
         )
 
     # =========================================================================
-    # 测试 2：模拟智能优化算法（GA/PSO/DE）随机生成的 50 组畸形/病态几何测试
+    # 测试 2：模拟智能优化算法随机生成的 50 组畸形 BSplineCurve 实例与不同阶数测试
     # =========================================================================
-    print("\n[第二部分] 模拟进化算法初期随机撒点：50 组极端畸形桨叶几何 + 解析梯度压测:")
+    print("\n[第二部分] 模拟进化算法初期随机撒点：50 组极端随机 BSplineCurve (degree=1~4) + 5 截面插值压测:")
     rng = np.random.default_rng(42)
     n_random_geom = 50
     cond_stress = fb.OperatingCondition(
@@ -162,22 +178,26 @@ def run_extreme_stress_tests():
     t0 = time.perf_counter()
     fallback_total = 0
     for k in range(n_random_geom):
-        # 随机生成极不合理的弦长: 包含 0.2mm 极细弦长到 0.55m 超宽弦长，甚至夹杂锯齿跳变
-        rand_chord = rng.uniform(0.0002, 0.55, size=20)
-        # 随机生成剧烈震荡的扭转角: -60 deg 到 +85 deg
-        rand_twist = np.deg2rad(rng.uniform(-60.0, 85.0, size=20))
+        deg = int(rng.integers(1, 5))
+        n_ctrl = int(rng.integers(deg + 1, 12))
+        x_ctrl = np.sort(rng.uniform(0.15, 0.95, size=n_ctrl))
+        x_ctrl[0] = geom.hub_radius / geom.radius
+        x_ctrl[-1] = 1.0
+
+        rand_chord_curve = fb.BSplineCurve(x_ctrl, rng.uniform(0.0002, 0.55, size=n_ctrl), degree=deg)
+        rand_twist_curve = fb.BSplineCurve(x_ctrl, np.deg2rad(rng.uniform(-60.0, 85.0, size=n_ctrl)), degree=deg)
         spin = 1 if (k % 2 == 0) else -1
 
         bad_geom = fb.RotorGeometry(
             num_blades=int(rng.integers(2, 7)),
             radius=geom.radius,
             hub_radius=geom.hub_radius,
-            r=geom.r,
-            chord=rand_chord,
-            twist=rand_twist,
-            airfoils=airfoils,
+            n_radial=20,
+            chord_curve=rand_chord_curve,
+            twist_curve=rand_twist_curve,
+            airfoils=section_airfoils,
+            section_r_norm=section_r_norm,
             spin_dir=spin,
-            dr=geom.dr,
         )
         bad_solver = fb.BEMTSolver(bad_geom, cfg)
         res_bad = bad_solver.solve(cond_stress, compute_gradients=True)
@@ -186,7 +206,7 @@ def run_extreme_stress_tests():
 
     elapsed_geom_ms = (time.perf_counter() - t0) * 1e3
     print(
-        f"  [PASS] 50 组极端随机几何 (弦长 0.2mm~0.55m, 扭转 -60°~+85°) 100% 通过！\n"
+        f"  [PASS] 50 组极端随机 BSplineCurve (阶数 1~4, 弦长 0.2mm~0.55m, 扭转 -60°~+85°) 100% 通过！\n"
         f"         -> 无任何 NaN/Inf 崩溃，总耗时: {elapsed_geom_ms:.1f} ms, 累计触发 Brent 保护微元: {fallback_total}"
     )
 
@@ -221,9 +241,9 @@ def run_extreme_stress_tests():
     )
 
     # =========================================================================
-    # 测试 4：在“深度失速 + 反流区 + 下降涡环”复合极端工况下校验解析梯度与有限差分一致性
+    # 测试 4：在复合极端工况下校验 BSplineCurve 控制点解析梯度与有限差分一致性
     # =========================================================================
-    print("\n[第四部分] 复合极端工况下 (含反流与失速外推) 解析梯度 vs 中心有限差分检验:")
+    print("\n[第四部分] 复合极端工况下 (含反流与失速外推) BSplineCurve 控制点解析梯度 vs 中心有限差分检验:")
     cond_hard = fb.OperatingCondition(
         vx=65.0, vy=-15.0, vz=-6.0, omega=160.0,
         pitch_0=np.deg2rad(22.0), pitch_1c=np.deg2rad(3.0), pitch_1s=np.deg2rad(-5.0),
@@ -231,27 +251,30 @@ def run_extreme_stress_tests():
     res_hard = solver.solve(cond_hard, compute_gradients=True)
 
     eps = 1e-6
-    fd_dT_dtwist = np.zeros(20)
-    fd_dQ_dchord = np.zeros(20)
-    for i in range(20):
-        tw_p, tw_m = geom.twist.copy(), geom.twist.copy()
-        tw_p[i] += eps
-        tw_m[i] -= eps
-        rp = fb.BEMTSolver(fb.RotorGeometry(3, geom.radius, geom.hub_radius, geom.r, geom.chord, tw_p, airfoils, 1, geom.dr), cfg).solve(cond_hard, False)
-        rm = fb.BEMTSolver(fb.RotorGeometry(3, geom.radius, geom.hub_radius, geom.r, geom.chord, tw_m, airfoils, 1, geom.dr), cfg).solve(cond_hard, False)
-        fd_dT_dtwist[i] = (rp.thrust - rm.thrust) / (2.0 * eps)
+    cc = geom.chord_curve
+    tc = geom.twist_curve
+    n_c = cc.num_ctrl_points
+    fd_dT_dtwist_ctrl = np.zeros(n_c)
+    fd_dQ_dchord_ctrl = np.zeros(n_c)
+    for k in range(n_c):
+        tw_p, tw_m = tc.ctrl_vals.copy(), tc.ctrl_vals.copy()
+        tw_p[k] += eps
+        tw_m[k] -= eps
+        gp_t = fb.RotorGeometry(3, geom.radius, geom.hub_radius, geom.n_radial, cc, fb.BSplineCurve(tc.ctrl_r_norm, tw_p, tc.degree), section_airfoils, section_r_norm, 1)
+        gm_t = fb.RotorGeometry(3, geom.radius, geom.hub_radius, geom.n_radial, cc, fb.BSplineCurve(tc.ctrl_r_norm, tw_m, tc.degree), section_airfoils, section_r_norm, 1)
+        fd_dT_dtwist_ctrl[k] = (fb.BEMTSolver(gp_t, cfg).solve(cond_hard, False).thrust - fb.BEMTSolver(gm_t, cfg).solve(cond_hard, False).thrust) / (2.0 * eps)
 
-        ch_p, ch_m = geom.chord.copy(), geom.chord.copy()
-        ch_p[i] += eps
-        ch_m[i] -= eps
-        rp_c = fb.BEMTSolver(fb.RotorGeometry(3, geom.radius, geom.hub_radius, geom.r, ch_p, geom.twist, airfoils, 1, geom.dr), cfg).solve(cond_hard, False)
-        rm_c = fb.BEMTSolver(fb.RotorGeometry(3, geom.radius, geom.hub_radius, geom.r, ch_m, geom.twist, airfoils, 1, geom.dr), cfg).solve(cond_hard, False)
-        fd_dQ_dchord[i] = (rp_c.torque - rm_c.torque) / (2.0 * eps)
+        ch_p, ch_m = cc.ctrl_vals.copy(), cc.ctrl_vals.copy()
+        ch_p[k] += eps
+        ch_m[k] -= eps
+        gp_c = fb.RotorGeometry(3, geom.radius, geom.hub_radius, geom.n_radial, fb.BSplineCurve(cc.ctrl_r_norm, ch_p, cc.degree), tc, section_airfoils, section_r_norm, 1)
+        gm_c = fb.RotorGeometry(3, geom.radius, geom.hub_radius, geom.n_radial, fb.BSplineCurve(cc.ctrl_r_norm, ch_m, cc.degree), tc, section_airfoils, section_r_norm, 1)
+        fd_dQ_dchord_ctrl[k] = (fb.BEMTSolver(gp_c, cfg).solve(cond_hard, False).torque - fb.BEMTSolver(gm_c, cfg).solve(cond_hard, False).torque) / (2.0 * eps)
 
-    err_twist = np.linalg.norm(res_hard.sensitivity.dT_dtwist - fd_dT_dtwist) / np.linalg.norm(fd_dT_dtwist)
-    err_chord = np.linalg.norm(res_hard.sensitivity.dQ_dchord - fd_dQ_dchord) / np.linalg.norm(fd_dQ_dchord)
-    print(f"  - 复合极端工况下 dT/d(twist) 相对 L2 误差 : {err_twist:.3e}")
-    print(f"  - 复合极端工况下 dQ/d(chord) 相对 L2 误差 : {err_chord:.3e}")
+    err_twist = np.linalg.norm(res_hard.sensitivity.dT_dtwist_ctrl - fd_dT_dtwist_ctrl) / np.linalg.norm(fd_dT_dtwist_ctrl)
+    err_chord = np.linalg.norm(res_hard.sensitivity.dQ_dchord_ctrl - fd_dQ_dchord_ctrl) / np.linalg.norm(fd_dQ_dchord_ctrl)
+    print(f"  - 复合极端工况下 dT/d(twist_ctrl) 相对 L2 误差 : {err_twist:.3e}")
+    print(f"  - 复合极端工况下 dQ/d(chord_ctrl) 相对 L2 误差 : {err_chord:.3e}")
     print("=" * 82)
 
 

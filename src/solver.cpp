@@ -78,7 +78,6 @@ double BEMTSolver::solve_cell_brent(int i_r,
             f_prev = f_curr;
         }
 
-        // 若全区间完全同号无交点，返回残差绝对值最小的安全点
         if (fa * fb > 0.0) {
             brent_ok = (min_abs_f < 1e-3);
             return std::clamp(best_p, lo_bound, hi_bound);
@@ -198,7 +197,8 @@ BEMTResult BEMTSolver::solve(const OperatingCondition& cond, bool compute_gradie
     const double vi_est   = (theta_75 > 0.0) ? std::max(1.0, 0.04 * v_tip * std::sqrt(theta_75)) : 0.5;
 
     const bool use_pitt_peters = (cfg_.wake_model == WakeModel::kGlauertPittPeters) && (v_inplane > 1e-5);
-    const int outer_iters      = use_pitt_peters ? std::max(2, cfg_.max_wake_iters) : 1;
+    // 允许外层不动点+割线加速迭代最多执行 max(16, max_wake_iters*4) 步，一旦残差 |kx_implied - kx| < 1e-11 立即收敛
+    const int max_outer_iters  = use_pitt_peters ? std::max(16, cfg_.max_wake_iters * 4) : 1;
 
     double kx = 0.0;
     double ky = 0.0;
@@ -210,20 +210,26 @@ BEMTResult BEMTSolver::solve(const OperatingCondition& cond, bool compute_gradie
     for (int i = 0; i < nr; ++i) {
         const double r_i = geom_.r[i];
         for (int j = 0; j < npsi; ++j) {
-            const double u_t_ij   = cond.omega * r_i + s_dir * (cond.vx * sin_psi[j] - cond.vy * cos_psi[j]);
-            const double abs_u_t  = std::max(std::abs(u_t_ij), 1.0);
+            const double u_t_ij  = cond.omega * r_i + s_dir * (cond.vx * sin_psi[j] - cond.vy * cos_psi[j]);
+            const double abs_u_t = std::max(std::abs(u_t_ij), 1.0);
             res.phi(i, j) = std::clamp(std::atan2(cond.vz + vi_est, abs_u_t), -0.8, 0.8);
         }
     }
 
-    int total_fallbacks = 0;
+    int total_fallbacks   = 0;
     int unconverged_cells = 0;
+    bool wake_converged   = !use_pitt_peters;
 
-    for (int wake_iter = 0; wake_iter < outer_iters; ++wake_iter) {
+    double kx_prev     = kx;
+    double res_kx_prev = 0.0;
+    bool has_prev_kx   = false;
+
+    for (int wake_iter = 0; wake_iter < max_outer_iters; ++wake_iter) {
         total_fallbacks   = 0;
         unconverged_cells = 0;
-        const bool is_final_wake_iter = (wake_iter == outer_iters - 1);
-        const double active_tol       = is_final_wake_iter ? cfg_.tol : std::max(cfg_.tol, 1e-7);
+        // 当尾迹已经收敛或到达最后一步时，启用严格容差 cfg_.tol 并完整写入 2D 物理场
+        const bool is_final_pass = wake_converged || (wake_iter == max_outer_iters - 1);
+        const double active_tol  = is_final_pass ? cfg_.tol : std::max(cfg_.tol, 1e-8);
 
         #pragma omp parallel for schedule(static) reduction(+:total_fallbacks, unconverged_cells) if(!omp_in_parallel())
         for (int i = 0; i < nr; ++i) {
@@ -240,14 +246,12 @@ BEMTResult BEMTSolver::solve(const OperatingCondition& cond, bool compute_gradie
                 const double u_t_ij = cond.omega * r_i + s_dir * (cond.vx * sin_psi[j] - cond.vy * cos_psi[j]);
                 const double u_p_ij = cond.vz;
 
-                // 使用 smooth_max 保证 wake_fac >= 0.1 且导数处处连续
                 const double raw_wake = 1.0 + kx * r_norm * cos_psi_rel[j] + ky * r_norm * sin_psi_rel[j];
                 const double wake_fac = math::smooth_max(raw_wake, 0.1, 0.02);
 
                 double phi_curr = res.phi(i, j);
                 bool cell_conv  = false;
 
-                // 阶段 1: 带回溯阻尼保护 (Backtracking) 的解析牛顿-拉夫逊法
                 for (int it = 0; it < cfg_.max_newton_iters; ++it) {
                     Dual1 phi_dual(phi_curr, 1.0);
                     auto out_dual = eval_element_kernel<Dual1>(
@@ -259,7 +263,7 @@ BEMTResult BEMTSolver::solve(const OperatingCondition& cond, bool compute_gradie
                     const double dr_dphi = out_dual.residual.grad(0);
 
                     if (!std::isfinite(r_val) || !std::isfinite(dr_dphi)) {
-                        break; // 一旦出现非有限值立即移交 Brent 兜底
+                        break;
                     }
 
                     if (std::abs(r_val) <= active_tol) {
@@ -271,27 +275,24 @@ BEMTResult BEMTSolver::solve(const OperatingCondition& cond, bool compute_gradie
                         double full_step = std::clamp(-r_val / dr_dphi, -cfg_.newton_max_step, cfg_.newton_max_step);
                         double phi_next  = std::clamp(phi_curr + full_step, -kHalfPi + 1e-4, kHalfPi - 1e-4);
 
-                        // 检查全步长是否恶化残差（防止在失速峰顶发生周期2跳动）
                         double r_next = eval_element_kernel<double>(
                             i, phi_next, c_i, theta_ij, u_p_ij, u_t_ij, v_inplane_sq, cond.omega, wake_fac, cond).residual;
 
                         if (std::abs(r_next) > std::abs(r_val)) {
-                            // 半步回溯阻尼
                             phi_next = std::clamp(phi_curr + 0.5 * full_step, -kHalfPi + 1e-4, kHalfPi - 1e-4);
                         }
                         phi_curr = phi_next;
                     } else {
-                        break; // 局部导数接近0，立即交由 Brent 处理
+                        break;
                     }
                 }
 
-                // 阶段 2: 鲁棒性铁律 —— 只要牛顿法未严格达到 active_tol，100% 启动 Brent 兜底！
                 if (!cell_conv) {
                     bool brent_ok = false;
                     phi_curr = solve_cell_brent(
                         i, c_i, theta_ij, u_p_ij, u_t_ij, v_inplane_sq, cond.omega, wake_fac, cond, phi_curr, brent_ok);
                     total_fallbacks += 1;
-                    if (!brent_ok && is_final_wake_iter) {
+                    if (!brent_ok && is_final_pass) {
                         unconverged_cells += 1;
                     }
                 }
@@ -302,7 +303,7 @@ BEMTResult BEMTSolver::solve(const OperatingCondition& cond, bool compute_gradie
                     i, phi_curr, c_i, theta_ij, u_p_ij, u_t_ij, v_inplane_sq, cond.omega, wake_fac, cond);
 
                 res.vi(i, j) = final_out.vi_local;
-                if (is_final_wake_iter) {
+                if (is_final_pass) {
                     res.alpha(i, j)    = final_out.alpha;
                     res.vt(i, j)       = final_out.vt_local;
                     res.cl(i, j)       = final_out.cl;
@@ -324,21 +325,35 @@ BEMTResult BEMTSolver::solve(const OperatingCondition& cond, bool compute_gradie
         }
         res.vi_disk_mean = weighted_vi_sum / A_disk;
 
-        // 使用 smooth_abs 保证尾迹轴向合速度永不为零
         const double vz_wake = math::smooth_abs(cond.vz + res.vi_disk_mean, 0.2);
         res.wake_skew_chi    = std::atan2(v_inplane, vz_wake);
 
+        if (is_final_pass) {
+            // 已经用收敛的 kx 完成了最终流场与气动力评估，严格保持 kx 与 phi* 同步并退出！
+            break;
+        }
+
         if (use_pitt_peters) {
-            const double kx_new = (15.0 * kPi / 23.0) * std::tan(0.5 * res.wake_skew_chi);
-            // 带欠松弛保护更新 kx，防止极端下降流下外层尾迹角震荡
-            const double diff_kx = std::abs(kx_new - kx);
-            kx = 0.7 * kx_new + 0.3 * kx;
-            if (diff_kx < 1e-5 && wake_iter >= 1) {
-                // 若提前收敛但尚未填充最后一步输出场，补填一次输出场后退出
-                if (!is_final_wake_iter) {
-                    continue;
+            const double kx_implied = (15.0 * kPi / 23.0) * std::tan(0.5 * res.wake_skew_chi);
+            const double res_kx     = kx_implied - kx;
+            const double diff_kx    = std::abs(res_kx);
+
+            if (diff_kx < 1e-10) {
+                kx             = kx_implied;
+                wake_converged = true;
+            } else {
+                double kx_next = kx_implied;
+                // 当不动点残差出现异号振荡时，采用割线/弦截内插一步消除振荡
+                if (has_prev_kx && (res_kx * res_kx_prev < 0.0)) {
+                    const double d_res = res_kx - res_kx_prev;
+                    if (std::abs(d_res) > 1e-14) {
+                        kx_next = kx - res_kx * ((kx - kx_prev) / d_res);
+                    }
                 }
-                break;
+                kx_prev     = kx;
+                res_kx_prev = res_kx;
+                has_prev_kx = true;
+                kx          = std::clamp(kx_next, 0.0, 15.0 * kPi / 23.0);
             }
         }
     }

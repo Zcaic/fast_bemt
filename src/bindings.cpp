@@ -8,6 +8,7 @@
 #include <nanobind/stl/vector.h>
 
 #include "bemt/airfoil.hpp"
+#include "bemt/bspline.hpp"
 #include "bemt/config.hpp"
 #include "bemt/solver.hpp"
 
@@ -15,12 +16,44 @@ namespace nb = nanobind;
 using namespace nb::literals;
 using namespace bemt;
 
+namespace {
+
+BSplineCurve parse_bspline_curve_arg(const nb::handle& obj,
+                                     int default_degree,
+                                     double x_min,
+                                     double x_max,
+                                     const ConstRefArrayXd& explicit_r_norm,
+                                     const char* name) {
+    if (nb::isinstance<BSplineCurve>(obj)) {
+        return nb::cast<BSplineCurve>(obj);
+    }
+
+    try {
+        ConstRefMatrixXd mat = nb::cast<ConstRefMatrixXd>(obj);
+        if (mat.cols() == 2 && mat.rows() >= 2 && explicit_r_norm.size() == 0) {
+            return BSplineCurve(mat, default_degree);
+        }
+    } catch (...) {
+    }
+
+    try {
+        ConstRefArrayXd vec = nb::cast<ConstRefArrayXd>(obj);
+        if (explicit_r_norm.size() > 0) {
+            return BSplineCurve(explicit_r_norm, vec, default_degree);
+        }
+        return BSplineCurve::from_1d_values(vec, default_degree, x_min, x_max);
+    } catch (...) {
+        throw std::invalid_argument(
+            std::string("RotorGeometry: ") + name +
+            " must be a BSplineCurve instance, a 2D numpy array of shape (N_ctrl, 2) with columns [r/R, value], or a 1D numpy array of shape (N_ctrl,).");
+    }
+}
+
+} // namespace
+
 NB_MODULE(_fast_bemt_impl, m) {
     m.doc() = "High-performance vectorized and differentiable oblique-inflow BEMT solver core";
 
-    // ========================================================================
-    // 1. 枚举类型 WakeModel
-    // ========================================================================
     nb::enum_<WakeModel>(m, "WakeModel")
         .value("GlauertPittPeters", WakeModel::kGlauertPittPeters,
                "Annulus Glauert momentum balance + Pitt-Peters oblique wake harmonic correction (Scheme A)")
@@ -30,9 +63,73 @@ NB_MODULE(_fast_bemt_impl, m) {
                "Independent local blade-element-sector momentum balance (Scheme B)")
         .export_values();
 
-    // ========================================================================
-    // 2. 三维翼型插值类 Airfoil3D
-    // ========================================================================
+    nb::class_<BSplineCurve>(m, "BSplineCurve")
+        .def(nb::init<>())
+        .def(nb::init<const ConstRefArrayXd&, const ConstRefArrayXd&, int>(),
+             "ctrl_r_norm"_a, "ctrl_vals"_a, "degree"_a = 3,
+             "Construct 2D parametric B-spline curve (r/R(u), val(u)) from 1D arrays ctrl_r_norm and ctrl_vals")
+        .def(nb::init<const ConstRefMatrixXd&, int>(),
+             "ctrl_points"_a, "degree"_a = 3,
+             "Construct 2D parametric B-spline curve from (N_ctrl x 2) matrix with columns [r/R, val]")
+        .def_static("from_1d_values", &BSplineCurve::from_1d_values,
+                    "ctrl_vals"_a, "degree"_a = 3, "r_norm_min"_a = 0.0, "r_norm_max"_a = 1.0,
+                    "Construct BSplineCurve from 1D control values using Greville abscissae on [r_norm_min, r_norm_max]")
+        .def("eval_u", &BSplineCurve::eval_u,
+             "u"_a,
+             "Evaluate (r_norm(u), val(u)) at scalar curve parameter u in [0, 1]")
+        .def("eval_u_batch", &BSplineCurve::eval_u_batch,
+             "u_vec"_a,
+             "Evaluate (r_norm_array, val_array) at an array of curve parameters u in [0, 1]")
+        .def("sample", &BSplineCurve::sample,
+             "n_points"_a = 200,
+             "Uniformly sample n_points along u in [0, 1], returning (r_norm_array, val_array) for plotting")
+        .def("eval_at_r_norm", &BSplineCurve::eval_at_r_norm,
+             "target_r_norm"_a,
+             "Invert r/R(u*) = target_r_norm and evaluate scalar val(u*)")
+        .def("eval_batch", &BSplineCurve::eval_batch,
+             "target_r_norm"_a,
+             "Invert r/R(u_i*) = target_r_norm[i] and evaluate val_array at radial stations")
+        .def("__call__", &BSplineCurve::eval_at_r_norm,
+             "target_r_norm"_a,
+             "Evaluate scalar val(u*) at a single radial station r/R")
+        .def("__call__", &BSplineCurve::eval_batch,
+             "target_r_norm"_a,
+             "Shorthand for eval_batch(target_r_norm)")
+        .def("invert_r_norm",
+             [](const BSplineCurve& self, double target_r_norm) {
+                 ArrayXd arr(1);
+                 arr[0] = target_r_norm;
+                 return self.invert_r_norm(arr)[0];
+             },
+             "target_r_norm"_a,
+             "Invert r/R(u*) = target_r_norm and return scalar curve parameter u* in [0, 1]")
+        .def("invert_r_norm", &BSplineCurve::invert_r_norm,
+             "target_r_norm"_a,
+             "Invert r/R(u_i*) = target_r_norm[i] and return curve parameters u* in [0, 1]")
+        .def("basis_matrix",
+             [](const BSplineCurve& self, const ConstRefArrayXd& target_r_norm) {
+                 return self.basis_matrix(target_r_norm, nullptr);
+             },
+             "target_r_norm"_a,
+             "Compute (N_r x N_ctrl) B-spline basis matrix evaluated at target_r_norm")
+        .def("slope_dy_dx",
+             [](const BSplineCurve& self, double target_r_norm) {
+                 ArrayXd arr(1);
+                 arr[0] = target_r_norm;
+                 return self.slope_dy_dx(arr)[0];
+             },
+             "target_r_norm"_a,
+             "Compute scalar derivative d(val)/d(r/R) at target_r_norm")
+        .def("slope_dy_dx", &BSplineCurve::slope_dy_dx,
+             "target_r_norm"_a,
+             "Compute derivative d(val)/d(r/R) at target_r_norm array")
+        .def_prop_ro("degree", &BSplineCurve::degree)
+        .def_prop_ro("num_ctrl_points", &BSplineCurve::num_ctrl_points)
+        .def_prop_ro("knots", &BSplineCurve::knots)
+        .def_prop_ro("ctrl_r_norm", &BSplineCurve::ctrl_r_norm)
+        .def_prop_ro("ctrl_vals", &BSplineCurve::ctrl_vals)
+        .def_prop_ro("ctrl_points", &BSplineCurve::ctrl_points);
+
     nb::class_<Airfoil3D>(m, "Airfoil3D")
         .def(nb::init<const ConstRefArrayXd&,
                       const ConstRefArrayXd&,
@@ -52,6 +149,12 @@ NB_MODULE(_fast_bemt_impl, m) {
                     "aspect_ratio"_a = 10.0,
                     "enable_extrapolation"_a = true,
                     "Construct Airfoil3D from 1D polar arrays (alpha [rad], Cl, Cd)")
+        .def_static("interpolate_section", &Airfoil3D::interpolate_section,
+                    "af0"_a, "af1"_a, "weight"_a,
+                    "Linearly blend two Airfoil3D tables: (1 - weight) * af0 + weight * af1")
+        .def_static("interpolate_spanwise_sections", &Airfoil3D::interpolate_spanwise_sections,
+                    "section_r_norm"_a, "section_airfoils"_a, "target_r_norm"_a,
+                    "Interpolate M master airfoil tables at section_r_norm onto N_r blade stations target_r_norm")
         .def("eval", &Airfoil3D::eval<double>,
              "alpha"_a, "re"_a = 1e6, "ma"_a = 0.0,
              "Evaluate (Cl, Cd) at scalar (alpha [rad], Re, Ma)")
@@ -75,9 +178,6 @@ NB_MODULE(_fast_bemt_impl, m) {
         .def_prop_ro("alpha_min", &Airfoil3D::alpha_min)
         .def_prop_ro("alpha_max", &Airfoil3D::alpha_max);
 
-    // ========================================================================
-    // 3. 旋翼几何结构体 RotorGeometry
-    // ========================================================================
     nb::class_<RotorGeometry>(m, "RotorGeometry")
         .def(nb::init<>())
         .def("__init__",
@@ -85,44 +185,179 @@ NB_MODULE(_fast_bemt_impl, m) {
                 int num_blades,
                 double radius,
                 double hub_radius,
-                const ConstRefArrayXd& r,
-                const ConstRefArrayXd& chord,
-                const ConstRefArrayXd& twist,
+                int n_radial,
+                const BSplineCurve& chord_curve,
+                const BSplineCurve& twist_curve,
                 std::vector<std::shared_ptr<const Airfoil3D>> airfoils,
-                int spin_dir,
-                const ConstRefArrayXd& dr) {
+                const ConstRefArrayXd& section_r_norm,
+                int spin_dir) {
                  new (t) RotorGeometry();
-                 t->num_blades = num_blades;
-                 t->radius     = radius;
-                 t->hub_radius = hub_radius;
-                 t->spin_dir   = spin_dir;
-                 t->r          = r;
-                 t->chord      = chord;
-                 t->twist      = twist;
-                 t->airfoils   = std::move(airfoils);
-                 if (dr.size() > 0) {
-                     t->dr = dr;
-                 }
+                 t->num_blades       = num_blades;
+                 t->radius           = radius;
+                 t->hub_radius       = hub_radius;
+                 t->n_radial         = n_radial;
+                 t->spin_dir         = spin_dir;
+                 t->chord_curve      = chord_curve;
+                 t->twist_curve      = twist_curve;
+                 t->section_r_norm   = section_r_norm;
+                 t->section_airfoils = std::move(airfoils);
                  t->validate_and_finalize();
              },
              "num_blades"_a, "radius"_a, "hub_radius"_a,
-             "r"_a, "chord"_a, "twist"_a, "airfoils"_a,
+             "n_radial"_a, "chord_curve"_a, "twist_curve"_a, "airfoils"_a,
+             "section_r_norm"_a = ArrayXd(),
+             "spin_dir"_a = 1)
+        .def("__init__",
+             [](RotorGeometry* t,
+                int num_blades,
+                double radius,
+                double hub_radius,
+                const ConstRefArrayXd& r,
+                const BSplineCurve& chord_curve,
+                const BSplineCurve& twist_curve,
+                std::vector<std::shared_ptr<const Airfoil3D>> airfoils,
+                const ConstRefArrayXd& section_r_norm,
+                int spin_dir,
+                const ConstRefArrayXd& dr) {
+                 new (t) RotorGeometry();
+                 t->num_blades       = num_blades;
+                 t->radius           = radius;
+                 t->hub_radius       = hub_radius;
+                 t->spin_dir         = spin_dir;
+                 t->r                = r;
+                 if (dr.size() > 0) {
+                     t->dr = dr;
+                 }
+                 t->chord_curve      = chord_curve;
+                 t->twist_curve      = twist_curve;
+                 t->section_r_norm   = section_r_norm;
+                 t->section_airfoils = std::move(airfoils);
+                 t->validate_and_finalize();
+             },
+             "num_blades"_a, "radius"_a, "hub_radius"_a,
+             "r"_a, "chord_curve"_a, "twist_curve"_a, "airfoils"_a,
+             "section_r_norm"_a = ArrayXd(),
              "spin_dir"_a = 1,
              "dr"_a = ArrayXd())
+        .def("__init__",
+             [](RotorGeometry* t,
+                int num_blades,
+                double radius,
+                double hub_radius,
+                int n_radial,
+                nb::handle chord_ctrl,
+                nb::handle twist_ctrl,
+                std::vector<std::shared_ptr<const Airfoil3D>> airfoils,
+                const ConstRefArrayXd& section_r_norm,
+                int spin_dir,
+                int bspline_degree,
+                const ConstRefArrayXd& chord_ctrl_r_norm,
+                const ConstRefArrayXd& twist_ctrl_r_norm) {
+                 new (t) RotorGeometry();
+                 t->num_blades       = num_blades;
+                 t->radius           = radius;
+                 t->hub_radius       = hub_radius;
+                 t->n_radial         = n_radial;
+                 t->spin_dir         = spin_dir;
+                 t->bspline_degree   = bspline_degree;
+                 t->section_r_norm   = section_r_norm;
+                 t->section_airfoils = std::move(airfoils);
+                 const double x_hub  = hub_radius / std::max(radius, 1e-12);
+                 t->chord_curve = parse_bspline_curve_arg(chord_ctrl, bspline_degree, x_hub, 1.0, chord_ctrl_r_norm, "chord_curve/chord_ctrl");
+                 t->twist_curve = parse_bspline_curve_arg(twist_ctrl, bspline_degree, x_hub, 1.0, twist_ctrl_r_norm, "twist_curve/twist_ctrl");
+                 t->validate_and_finalize();
+             },
+             "num_blades"_a, "radius"_a, "hub_radius"_a,
+             "n_radial"_a, "chord_ctrl"_a, "twist_ctrl"_a, "airfoils"_a,
+             "section_r_norm"_a = ArrayXd(),
+             "spin_dir"_a = 1,
+             "bspline_degree"_a = 3,
+             "chord_ctrl_r_norm"_a = ArrayXd(),
+             "twist_ctrl_r_norm"_a = ArrayXd())
+        .def("__init__",
+             [](RotorGeometry* t,
+                int num_blades,
+                double radius,
+                double hub_radius,
+                const ConstRefArrayXd& r,
+                nb::handle chord_ctrl,
+                nb::handle twist_ctrl,
+                std::vector<std::shared_ptr<const Airfoil3D>> airfoils,
+                int spin_dir,
+                const ConstRefArrayXd& dr,
+                int bspline_degree,
+                const ConstRefArrayXd& section_r_norm,
+                const ConstRefArrayXd& chord_ctrl_r_norm,
+                const ConstRefArrayXd& twist_ctrl_r_norm) {
+                 new (t) RotorGeometry();
+                 t->num_blades       = num_blades;
+                 t->radius           = radius;
+                 t->hub_radius       = hub_radius;
+                 t->spin_dir         = spin_dir;
+                 t->bspline_degree   = bspline_degree;
+                 t->r                = r;
+                 t->section_r_norm   = section_r_norm;
+                 t->section_airfoils = std::move(airfoils);
+                 if (dr.size() > 0) {
+                     t->dr = dr;
+                 }
+                 const double x_hub = hub_radius / std::max(radius, 1e-12);
+                 t->chord_curve = parse_bspline_curve_arg(chord_ctrl, bspline_degree, x_hub, 1.0, chord_ctrl_r_norm, "chord_curve/chord_ctrl");
+                 t->twist_curve = parse_bspline_curve_arg(twist_ctrl, bspline_degree, x_hub, 1.0, twist_ctrl_r_norm, "twist_curve/twist_ctrl");
+                 t->validate_and_finalize();
+             },
+             "num_blades"_a, "radius"_a, "hub_radius"_a,
+             "r"_a, "chord_ctrl"_a, "twist_ctrl"_a, "airfoils"_a,
+             "spin_dir"_a = 1,
+             "dr"_a = ArrayXd(),
+             "bspline_degree"_a = 3,
+             "section_r_norm"_a = ArrayXd(),
+             "chord_ctrl_r_norm"_a = ArrayXd(),
+             "twist_ctrl_r_norm"_a = ArrayXd())
         .def_rw("num_blades", &RotorGeometry::num_blades)
         .def_rw("radius", &RotorGeometry::radius)
         .def_rw("hub_radius", &RotorGeometry::hub_radius)
         .def_rw("spin_dir", &RotorGeometry::spin_dir)
+        .def_rw("n_radial", &RotorGeometry::n_radial)
+        .def_rw("bspline_degree", &RotorGeometry::bspline_degree)
         .def_rw("r", &RotorGeometry::r)
         .def_rw("dr", &RotorGeometry::dr)
-        .def_rw("chord", &RotorGeometry::chord)
-        .def_rw("twist", &RotorGeometry::twist)
-        .def_rw("airfoils", &RotorGeometry::airfoils)
+        .def_rw("chord_curve", &RotorGeometry::chord_curve)
+        .def_rw("twist_curve", &RotorGeometry::twist_curve)
+        .def_rw("chord_ctrl_r_norm", &RotorGeometry::chord_ctrl_r_norm)
+        .def_rw("chord_ctrl", &RotorGeometry::chord_ctrl)
+        .def_rw("twist_ctrl_r_norm", &RotorGeometry::twist_ctrl_r_norm)
+        .def_rw("twist_ctrl", &RotorGeometry::twist_ctrl)
+        .def_rw("section_r_norm", &RotorGeometry::section_r_norm)
+        .def_rw("section_airfoils", &RotorGeometry::section_airfoils)
+        .def_ro("chord_knots", &RotorGeometry::chord_knots)
+        .def_ro("twist_knots", &RotorGeometry::twist_knots)
+        .def_ro("chord_u_params", &RotorGeometry::chord_u_params)
+        .def_ro("twist_u_params", &RotorGeometry::twist_u_params)
+        .def_ro("chord_basis", &RotorGeometry::chord_basis)
+        .def_ro("twist_basis", &RotorGeometry::twist_basis)
+        .def_ro("dchord_dr_norm", &RotorGeometry::dchord_dr_norm)
+        .def_ro("dtwist_dr_norm", &RotorGeometry::dtwist_dr_norm)
+        .def_ro("chord", &RotorGeometry::chord)
+        .def_ro("twist", &RotorGeometry::twist)
+        .def_ro("airfoils", &RotorGeometry::airfoils)
         .def("validate_and_finalize", &RotorGeometry::validate_and_finalize);
 
-    // ========================================================================
-    // 4. 运行工况结构体 OperatingCondition
-    // ========================================================================
+    m.def("build_clamped_uniform_knots", &bspline::build_clamped_uniform_knots,
+          "n_ctrl"_a, "degree"_a = 3);
+    m.def("build_greville_abscissae", &bspline::build_greville_abscissae,
+          "n_ctrl"_a, "degree"_a = 3, "x_min"_a = 0.0, "x_max"_a = 1.0);
+    m.def("build_bspline_basis_matrix",
+          [](const ConstRefArrayXd& r, double hub_radius, double radius, int n_ctrl, int degree) {
+              return bspline::build_basis_matrix(r, hub_radius, radius, n_ctrl, degree, nullptr);
+          },
+          "r"_a, "hub_radius"_a, "radius"_a, "n_ctrl"_a, "degree"_a = 3);
+    m.def("build_parametric_bspline_basis_matrix",
+          [](const ConstRefArrayXd& target_r_norm, const ConstRefArrayXd& ctrl_r_norm, int degree) {
+              return bspline::build_parametric_basis_matrix(target_r_norm, ctrl_r_norm, degree, nullptr, nullptr);
+          },
+          "target_r_norm"_a, "ctrl_r_norm"_a, "degree"_a = 3);
+
     nb::class_<OperatingCondition>(m, "OperatingCondition")
         .def(nb::init<>())
         .def("__init__",
@@ -163,9 +398,6 @@ NB_MODULE(_fast_bemt_impl, m) {
         .def_rw("mu", &OperatingCondition::mu)
         .def_rw("a_sound", &OperatingCondition::a_sound);
 
-    // ========================================================================
-    // 5. 求解器配置结构体 SolverConfig
-    // ========================================================================
     nb::class_<SolverConfig>(m, "SolverConfig")
         .def(nb::init<>())
         .def("__init__",
@@ -179,7 +411,8 @@ NB_MODULE(_fast_bemt_impl, m) {
                 int max_newton_iters,
                 int max_brent_iters,
                 int max_wake_iters,
-                double tol) {
+                double tol,
+                double newton_max_step) {
                  new (t) SolverConfig();
                  t->n_azimuth                   = n_azimuth;
                  t->wake_model                  = wake_model;
@@ -191,6 +424,7 @@ NB_MODULE(_fast_bemt_impl, m) {
                  t->max_brent_iters             = max_brent_iters;
                  t->max_wake_iters              = max_wake_iters;
                  t->tol                         = tol;
+                 t->newton_max_step             = newton_max_step;
              },
              "n_azimuth"_a = 36,
              "wake_model"_a = WakeModel::kGlauertPittPeters,
@@ -201,7 +435,8 @@ NB_MODULE(_fast_bemt_impl, m) {
              "max_newton_iters"_a = 15,
              "max_brent_iters"_a = 60,
              "max_wake_iters"_a = 4,
-             "tol"_a = 1e-10)
+             "tol"_a = 1e-10,
+             "newton_max_step"_a = 0.25)
         .def_rw("n_azimuth", &SolverConfig::n_azimuth)
         .def_rw("wake_model", &SolverConfig::wake_model)
         .def_rw("enable_tip_loss", &SolverConfig::enable_tip_loss)
@@ -214,28 +449,68 @@ NB_MODULE(_fast_bemt_impl, m) {
         .def_rw("tol", &SolverConfig::tol)
         .def_rw("newton_max_step", &SolverConfig::newton_max_step);
 
-    // ========================================================================
-    // 6. 解析导数结果结构体 BEMTSensitivity
-    // ========================================================================
     nb::class_<BEMTSensitivity>(m, "BEMTSensitivity")
         .def_ro("valid", &BEMTSensitivity::valid)
+        .def_ro("dT_dchord_ctrl", &BEMTSensitivity::dT_dchord_ctrl)
+        .def_ro("dT_dtwist_ctrl", &BEMTSensitivity::dT_dtwist_ctrl)
+        .def_ro("dQ_dchord_ctrl", &BEMTSensitivity::dQ_dchord_ctrl)
+        .def_ro("dQ_dtwist_ctrl", &BEMTSensitivity::dQ_dtwist_ctrl)
+        .def_ro("dP_dchord_ctrl", &BEMTSensitivity::dP_dchord_ctrl)
+        .def_ro("dP_dtwist_ctrl", &BEMTSensitivity::dP_dtwist_ctrl)
+        .def_ro("dFx_dchord_ctrl", &BEMTSensitivity::dFx_dchord_ctrl)
+        .def_ro("dFx_dtwist_ctrl", &BEMTSensitivity::dFx_dtwist_ctrl)
+        .def_ro("dFy_dchord_ctrl", &BEMTSensitivity::dFy_dchord_ctrl)
+        .def_ro("dFy_dtwist_ctrl", &BEMTSensitivity::dFy_dtwist_ctrl)
+        .def_ro("dMx_dchord_ctrl", &BEMTSensitivity::dMx_dchord_ctrl)
+        .def_ro("dMx_dtwist_ctrl", &BEMTSensitivity::dMx_dtwist_ctrl)
+        .def_ro("dMy_dchord_ctrl", &BEMTSensitivity::dMy_dchord_ctrl)
+        .def_ro("dMy_dtwist_ctrl", &BEMTSensitivity::dMy_dtwist_ctrl)
+        .def_ro("dT_dchord_ctrl_r", &BEMTSensitivity::dT_dchord_ctrl_r)
+        .def_ro("dT_dtwist_ctrl_r", &BEMTSensitivity::dT_dtwist_ctrl_r)
+        .def_ro("dQ_dchord_ctrl_r", &BEMTSensitivity::dQ_dchord_ctrl_r)
+        .def_ro("dQ_dtwist_ctrl_r", &BEMTSensitivity::dQ_dtwist_ctrl_r)
+        .def_ro("dP_dchord_ctrl_r", &BEMTSensitivity::dP_dchord_ctrl_r)
+        .def_ro("dP_dtwist_ctrl_r", &BEMTSensitivity::dP_dtwist_ctrl_r)
+        .def_ro("dFx_dchord_ctrl_r", &BEMTSensitivity::dFx_dchord_ctrl_r)
+        .def_ro("dFx_dtwist_ctrl_r", &BEMTSensitivity::dFx_dtwist_ctrl_r)
+        .def_ro("dFy_dchord_ctrl_r", &BEMTSensitivity::dFy_dchord_ctrl_r)
+        .def_ro("dFy_dtwist_ctrl_r", &BEMTSensitivity::dFy_dtwist_ctrl_r)
+        .def_ro("dMx_dchord_ctrl_r", &BEMTSensitivity::dMx_dchord_ctrl_r)
+        .def_ro("dMx_dtwist_ctrl_r", &BEMTSensitivity::dMx_dtwist_ctrl_r)
+        .def_ro("dMy_dchord_ctrl_r", &BEMTSensitivity::dMy_dchord_ctrl_r)
+        .def_ro("dMy_dtwist_ctrl_r", &BEMTSensitivity::dMy_dtwist_ctrl_r)
         .def_ro("dT_dchord", &BEMTSensitivity::dT_dchord)
         .def_ro("dT_dtwist", &BEMTSensitivity::dT_dtwist)
         .def_ro("dQ_dchord", &BEMTSensitivity::dQ_dchord)
         .def_ro("dQ_dtwist", &BEMTSensitivity::dQ_dtwist)
         .def_ro("dP_dchord", &BEMTSensitivity::dP_dchord)
         .def_ro("dP_dtwist", &BEMTSensitivity::dP_dtwist)
+        .def_ro("dFx_dchord", &BEMTSensitivity::dFx_dchord)
+        .def_ro("dFx_dtwist", &BEMTSensitivity::dFx_dtwist)
+        .def_ro("dFy_dchord", &BEMTSensitivity::dFy_dchord)
+        .def_ro("dFy_dtwist", &BEMTSensitivity::dFy_dtwist)
         .def_ro("dMx_dchord", &BEMTSensitivity::dMx_dchord)
         .def_ro("dMx_dtwist", &BEMTSensitivity::dMx_dtwist)
         .def_ro("dMy_dchord", &BEMTSensitivity::dMy_dchord)
         .def_ro("dMy_dtwist", &BEMTSensitivity::dMy_dtwist)
+        .def_ro("dT_dcl", &BEMTSensitivity::dT_dcl)
+        .def_ro("dT_dcd", &BEMTSensitivity::dT_dcd)
+        .def_ro("dQ_dcl", &BEMTSensitivity::dQ_dcl)
+        .def_ro("dQ_dcd", &BEMTSensitivity::dQ_dcd)
+        .def_ro("dP_dcl", &BEMTSensitivity::dP_dcl)
+        .def_ro("dP_dcd", &BEMTSensitivity::dP_dcd)
+        .def_ro("dFx_dcl", &BEMTSensitivity::dFx_dcl)
+        .def_ro("dFx_dcd", &BEMTSensitivity::dFx_dcd)
+        .def_ro("dFy_dcl", &BEMTSensitivity::dFy_dcl)
+        .def_ro("dFy_dcd", &BEMTSensitivity::dFy_dcd)
+        .def_ro("dMx_dcl", &BEMTSensitivity::dMx_dcl)
+        .def_ro("dMx_dcd", &BEMTSensitivity::dMx_dcd)
+        .def_ro("dMy_dcl", &BEMTSensitivity::dMy_dcl)
+        .def_ro("dMy_dcd", &BEMTSensitivity::dMy_dcd)
         .def_ro("dForces_dCond", &BEMTSensitivity::dForces_dCond)
         .def_ro("dTr_dchord_diag", &BEMTSensitivity::dTr_dchord_diag)
         .def_ro("dTr_dtwist_diag", &BEMTSensitivity::dTr_dtwist_diag);
 
-    // ========================================================================
-    // 7. 求解结果结构体 BEMTResult
-    // ========================================================================
     nb::class_<BEMTResult>(m, "BEMTResult")
         .def_ro("converged", &BEMTResult::converged)
         .def_ro("total_fallback_cells", &BEMTResult::total_fallback_cells)
@@ -273,9 +548,6 @@ NB_MODULE(_fast_bemt_impl, m) {
         .def_ro("df_theta", &BEMTResult::df_theta)
         .def_ro("sensitivity", &BEMTResult::sensitivity);
 
-    // ========================================================================
-    // 8. 核心求解器类 BEMTSolver (求解时自动释放 Python GIL 锁，充分发挥 OpenMP 性能)
-    // ========================================================================
     nb::class_<BEMTSolver>(m, "BEMTSolver")
         .def(nb::init<RotorGeometry, SolverConfig>(),
              "geom"_a, "cfg"_a = SolverConfig{})

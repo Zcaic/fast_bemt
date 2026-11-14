@@ -96,8 +96,10 @@ struct Dual {
 };
 
 // 常用维度别名
-using Dual1 = Dual<1>; // 单变量求导（用于牛顿迭代求根 R(phi) = 0）
-using Dual6 = Dual<6>; // 局部叶素对 (phi, chord, twist, Vx, Vy, Vz/Omega) 同時求偏导
+using Dual1  = Dual<1>;  // 单变量求导（用于牛顿迭代求根 R(phi) = 0）
+using Dual6  = Dual<6>;  // 局部 6 变量求偏导别名
+using Dual9  = Dual<9>;  // 局部叶素对 (phi, chord, twist, omega, pitch_0, vx, vy, vz, wake_fac) 同时求偏导
+using Dual11 = Dual<11>; // 局部叶素扩展 (附加 cl_2d_offset, cd_2d_offset) 以同时输出对翼型极曲线 (Cl, Cd) 的解析导数
 
 // ============================================================================
 // 二元算术运算符 (Dual op Dual, Dual op double, double op Dual)
@@ -177,7 +179,12 @@ template <int N> inline bool operator>=(const Dual<N>& a, double b)         { re
 template <int N> inline bool operator>=(double a, const Dual<N>& b)         { return a >= b.val; }
 
 template <int N> inline bool operator==(const Dual<N>& a, const Dual<N>& b) { return a.val == b.val; }
+template <int N> inline bool operator==(const Dual<N>& a, double b)         { return a.val == b; }
+template <int N> inline bool operator==(double a, const Dual<N>& b)         { return a == b.val; }
+
 template <int N> inline bool operator!=(const Dual<N>& a, const Dual<N>& b) { return a.val != b.val; }
+template <int N> inline bool operator!=(const Dual<N>& a, double b)         { return a.val != b; }
+template <int N> inline bool operator!=(double a, const Dual<N>& b)         { return a != b.val; }
 
 // ============================================================================
 // 初等数学函数重载（支持 ADL 实参依赖查找，可直接 using std::sin; sin(x) 调用）
@@ -200,14 +207,12 @@ inline Dual<N> tan(const Dual<N>& x) {
 
 template <int N>
 inline Dual<N> asin(const Dual<N>& x) {
-    // 边界正则化保护，防止 |x| -> 1 时导数变为 NaN
     const double arg = std::clamp(x.val, -1.0 + 1e-12, 1.0 - 1e-12);
     return Dual<N>(std::asin(arg), x.d / std::sqrt(1.0 - arg * arg));
 }
 
 template <int N>
 inline Dual<N> acos(const Dual<N>& x) {
-    // Prandtl 叶尖损失因子 F = (2/pi)*acos(exp(-f)) 核心调用，必须带边界防除零保护
     const double arg = std::clamp(x.val, -1.0 + 1e-12, 1.0 - 1e-12);
     return Dual<N>(std::acos(arg), -x.d / std::sqrt(1.0 - arg * arg));
 }
@@ -296,16 +301,12 @@ inline std::ostream& operator<<(std::ostream& os, const Dual<N>& x) {
     return os;
 }
 
-// 提取实部辅助函数（兼容 double 和 Dual<N> 泛型模板编程）
 inline double val_of(double x) { return x; }
 template <int N>
 inline double val_of(const Dual<N>& x) { return x.val; }
 
 } // namespace bemt
 
-// ============================================================================
-// Eigen::NumTraits 特化，允许直接构建 Eigen::Array<Dual<N>, ...>
-// ============================================================================
 namespace Eigen {
 template <int N>
 struct NumTraits<bemt::Dual<N>> : NumTraits<double> {

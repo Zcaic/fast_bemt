@@ -4,6 +4,7 @@
 #include "bemt/types.hpp"
 #include <algorithm>
 #include <cmath>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -14,7 +15,7 @@ namespace bemt {
 // ============================================================================
 // 三维翼型极曲线插值器 Airfoil3D
 // 维度约定: (alpha [rad], Re [-], Ma [-]) -> (Cl, Cd)
-// 支持标量 double、自动微分 Dual<N> 以及沿周向/径向的批量向量化求值
+// 支持标量 double、自动微分 Dual<N>、批量向量化求值以及展向多翼型截面自动线性融合插值
 // ============================================================================
 class Airfoil3D {
 public:
@@ -49,6 +50,24 @@ public:
                                    double aspect_ratio = 10.0,
                                    bool enable_extrapolation = true);
 
+    /**
+     * @brief 展向两相邻截面翼型表线性插值融合: (1 - weight) * af0 + weight * af1
+     *        若两翼型网格相同，直接在线性空间融合 Hermite 导数表（O(1) 零损耗）；
+     *        若网格不同，自动在合并网格上重采样构造新表。
+     */
+    static std::shared_ptr<const Airfoil3D> interpolate_section(
+        const std::shared_ptr<const Airfoil3D>& af0,
+        const std::shared_ptr<const Airfoil3D>& af1,
+        double weight);
+
+    /**
+     * @brief 将有限个控制截面的翼型表 (section_r_norm, section_airfoils) 自动插值映射到 N_r 个离散叶素站位 r_norm = r / R 上
+     */
+    static std::vector<std::shared_ptr<const Airfoil3D>> interpolate_spanwise_sections(
+        const ConstRefArrayXd& section_r_norm,
+        const std::vector<std::shared_ptr<const Airfoil3D>>& section_airfoils,
+        const ConstRefArrayXd& target_r_norm);
+
     // ------------------------------------------------------------------------
     // 核心泛型求值接口：同时兼容 double 与 Dual<N>
     // 输入: alpha [rad], re [-], ma [-]
@@ -62,40 +81,43 @@ public:
         using std::log10;
         using std::sin;
 
-        // 1. 雷诺数转 log10(Re) 并平滑夹断在表格边界内
         const Scalar safe_re     = math::smooth_max(re, Scalar(100.0), 1.0);
         const Scalar log_re      = log10(safe_re);
-        const Scalar lre_clamped = clamp_coord(log_re, log_re_grid_);
-        const Scalar ma_clamped  = clamp_coord(ma, ma_grid_);
+        const Scalar lre_clamped = (n_re_ > 1)
+                                       ? math::smooth_clamp(log_re, log_re_grid_[0], log_re_grid_[n_re_ - 1], 1e-4)
+                                       : Scalar(log_re_grid_[0]);
+        const Scalar ma_clamped  = (n_ma_ > 1)
+                                       ? math::smooth_clamp(ma, ma_grid_[0], ma_grid_[n_ma_ - 1], 1e-4)
+                                       : Scalar(ma_grid_[0]);
 
         const double a_min = alpha_grid_[0];
         const double a_max = alpha_grid_[n_a_ - 1];
-        const double blend_width = 1.0 * kDeg2Rad; // 1度紧凑过渡带
+        const double blend_width = std::min(0.8 * kDeg2Rad, 0.05 * (a_max - a_min));
         const double a_val = val_of(alpha);
 
-        // 2. 快速通道：只要迎角在 [a_min + 2*width, a_max - 2*width] 内，100% 走纯表格三立方插值
-        if (!enable_extrapolation_ ||
-            (a_val >= a_min + 2.0 * blend_width && a_val <= a_max - 2.0 * blend_width)) {
-            const Scalar alpha_clamped = clamp_coord(alpha, alpha_grid_);
+        // 1. 快速通道：禁用外推，或迎角在表格内部 [a_min + 8*w, a_max - 8*w] 时，sigmoid 权重为 1.0 (误差 < 3e-4)
+        if (!enable_extrapolation_) {
+            const Scalar alpha_clamped = math::smooth_clamp(alpha, a_min, a_max, 1e-4);
             return eval_tricubic_table(alpha_clamped, lre_clamped, ma_clamped);
         }
+        if (a_val >= a_min + 8.0 * blend_width && a_val <= a_max - 8.0 * blend_width) {
+            return eval_tricubic_table(alpha, lre_clamped, ma_clamped);
+        }
 
-        // 3. 若完全处于深失速外推区 (超出边界 > 3*width)，无需再算内部表格插值
-        const double lre_v = val_of(lre_clamped);
-        const double ma_v  = val_of(ma_clamped);
-        auto [cl_hi_v, cd_hi_v] = eval_tricubic_table<double>(a_max, lre_v, ma_v);
-        auto [cl_lo_v, cd_lo_v] = eval_tricubic_table<double>(a_min, lre_v, ma_v);
+        // 2. 计算高低失速边界点处的气动系数
+        auto [cl_hi, cd_hi] = eval_tricubic_table(Scalar(a_max), lre_clamped, ma_clamped);
+        auto [cl_lo, cd_lo] = eval_tricubic_table(Scalar(a_min), lre_clamped, ma_clamped);
 
-        auto [cl_vc, cd_vc] = eval_viterna_corrigan(
-            alpha, Scalar(cl_hi_v), Scalar(cd_hi_v), Scalar(cl_lo_v), Scalar(cd_lo_v));
+        auto [cl_vc, cd_vc] = eval_viterna_corrigan(alpha, cl_hi, cd_hi, cl_lo, cd_lo);
 
-        if (a_val <= a_min - 3.0 * blend_width || a_val >= a_max + 3.0 * blend_width) {
+        // 若完全超出过渡带 (> 8*w)，直接返回纯 Viterna-Corrigan 外推
+        if (a_val <= a_min - 8.0 * blend_width || a_val >= a_max + 8.0 * blend_width) {
             return {cl_vc, cd_vc};
         }
 
-        // 4. 仅在边界 +/- 2~3 度窄带内平滑混合表格与 Viterna-Corrigan
-        const Scalar alpha_clamped = clamp_coord(alpha, alpha_grid_);
-        auto [cl_tbl, cd_tbl] = eval_tricubic_table(alpha_clamped, lre_clamped, ma_clamped);
+        // 3. 在边界过渡带内：用 smooth_clamp 代替硬 clamp_coord，彻底消除 a_min/a_max 处的导数断崖！
+        const Scalar alpha_smooth = math::smooth_clamp(alpha, a_min, a_max, 0.5 * blend_width);
+        auto [cl_tbl, cd_tbl] = eval_tricubic_table(alpha_smooth, lre_clamped, ma_clamped);
 
         const Scalar w_low  = math::sigmoid_weight(alpha, a_min, blend_width);
         const Scalar w_high = Scalar(1.0) - math::sigmoid_weight(alpha, a_max, blend_width);
@@ -183,17 +205,6 @@ private:
         t = (x - grid[i_cell]) / h;
     }
 
-    // 坐标边界平滑裁剪
-    template <typename Scalar>
-    inline Scalar clamp_coord(const Scalar& x, const ArrayXd& grid) const {
-        if (grid.size() <= 1) return Scalar(grid[0]);
-        const double lo = grid[0];
-        const double hi = grid[grid.size() - 1];
-        if (val_of(x) <= lo) return Scalar(lo) + (x - Scalar(val_of(x))) * 0.0;
-        if (val_of(x) >= hi) return Scalar(hi) + (x - Scalar(val_of(x))) * 0.0;
-        return x;
-    }
-
     // 1D 三次 Hermite 基函数求值: 给定左端点 (f0, d0) 与右端点 (f1, d1)，步长 h，归一化坐标 t in [0,1]
     template <typename Scalar>
     static inline Scalar hermite_1d(const Scalar& t,
@@ -211,7 +222,7 @@ private:
         return h00 * f0 + (h10 * h) * d0 + h01 * f1 + (h11 * h) * d1;
     }
 
-    // 在三维网格内部执行三立方 Hermite 插值
+    // 在三维网格内部执行三立方 Hermite 插值 (保证跨 (alpha, Re, Ma) 网格线的 C^1 值与一阶导数连续性)
     template <typename Scalar>
     inline std::pair<Scalar, Scalar> eval_tricubic_table(const Scalar& alpha,
                                                          const Scalar& log_re,
@@ -224,7 +235,9 @@ private:
         locate_interval(log_re, log_re_grid_, ire, tlre, hlre);
         locate_interval(ma, ma_grid_, ima, tma, hma);
 
-        // 先沿 alpha 维度对周围 (2 x 2) 个 (Re, Ma) 柱面进行三次 Hermite 插值
+        const Scalar sa   = ta * ta * (3.0 - 2.0 * ta);
+        const Scalar slre = tlre * tlre * (3.0 - 2.0 * tlre);
+
         auto interp_alpha_col = [&](const std::vector<NodeJet>& jets, int r_idx, int m_idx) -> Scalar {
             const NodeJet& n0 = jets[idx(ia, r_idx, m_idx)];
             const NodeJet& n1 = jets[idx(ia + 1, r_idx, m_idx)];
@@ -235,7 +248,6 @@ private:
             return {interp_alpha_col(cl_jets_, 0, 0), interp_alpha_col(cd_jets_, 0, 0)};
         }
 
-        // 沿 log10(Re) 维度进行三次 Hermite 插值
         auto interp_re_plane = [&](const std::vector<NodeJet>& jets, int m_idx) -> Scalar {
             if (n_re_ == 1) {
                 return interp_alpha_col(jets, 0, m_idx);
@@ -245,11 +257,11 @@ private:
 
             const double d_re0_a0 = jets[idx(ia, ire, m_idx)].flre;
             const double d_re0_a1 = jets[idx(ia + 1, ire, m_idx)].flre;
-            const Scalar d_re0    = (1.0 - ta) * d_re0_a0 + ta * d_re0_a1;
+            const Scalar d_re0    = (1.0 - sa) * d_re0_a0 + sa * d_re0_a1;
 
             const double d_re1_a0 = jets[idx(ia, ire + 1, m_idx)].flre;
             const double d_re1_a1 = jets[idx(ia + 1, ire + 1, m_idx)].flre;
-            const Scalar d_re1    = (1.0 - ta) * d_re1_a0 + ta * d_re1_a1;
+            const Scalar d_re1    = (1.0 - sa) * d_re1_a0 + sa * d_re1_a1;
 
             return hermite_1d(tlre, hlre, f_re0, d_re0, f_re1, d_re1);
         };
@@ -258,18 +270,27 @@ private:
             return {interp_re_plane(cl_jets_, 0), interp_re_plane(cd_jets_, 0)};
         }
 
-        // 沿 Ma 维度进行三次 Hermite 插值
         auto interp_full_3d = [&](const std::vector<NodeJet>& jets) -> Scalar {
             const Scalar f_ma0 = interp_re_plane(jets, ima);
             const Scalar f_ma1 = interp_re_plane(jets, ima + 1);
 
-            const double d_ma0_0 = jets[idx(ia, ire, ima)].fma;
-            const double d_ma0_1 = jets[idx(ia + 1, ire, ima)].fma;
-            const Scalar d_ma0   = (1.0 - ta) * d_ma0_0 + ta * d_ma0_1;
+            Scalar d_ma0, d_ma1;
+            if (n_re_ == 1) {
+                d_ma0 = (1.0 - sa) * jets[idx(ia, 0, ima)].fma + sa * jets[idx(ia + 1, 0, ima)].fma;
+                d_ma1 = (1.0 - sa) * jets[idx(ia, 0, ima + 1)].fma + sa * jets[idx(ia + 1, 0, ima + 1)].fma;
+            } else {
+                const Scalar d_ma0_re0 = (1.0 - sa) * jets[idx(ia, ire, ima)].fma +
+                                         sa * jets[idx(ia + 1, ire, ima)].fma;
+                const Scalar d_ma0_re1 = (1.0 - sa) * jets[idx(ia, ire + 1, ima)].fma +
+                                         sa * jets[idx(ia + 1, ire + 1, ima)].fma;
+                d_ma0 = (1.0 - slre) * d_ma0_re0 + slre * d_ma0_re1;
 
-            const double d_ma1_0 = jets[idx(ia, ire, ima + 1)].fma;
-            const double d_ma1_1 = jets[idx(ia + 1, ire, ima + 1)].fma;
-            const Scalar d_ma1   = (1.0 - ta) * d_ma1_0 + ta * d_ma1_1;
+                const Scalar d_ma1_re0 = (1.0 - sa) * jets[idx(ia, ire, ima + 1)].fma +
+                                         sa * jets[idx(ia + 1, ire, ima + 1)].fma;
+                const Scalar d_ma1_re1 = (1.0 - sa) * jets[idx(ia, ire + 1, ima + 1)].fma +
+                                         sa * jets[idx(ia + 1, ire + 1, ima + 1)].fma;
+                d_ma1 = (1.0 - slre) * d_ma1_re0 + slre * d_ma1_re1;
+            }
 
             return hermite_1d(tma, hma, f_ma0, d_ma0, f_ma1, d_ma1);
         };
@@ -307,7 +328,6 @@ private:
         const Scalar A1_neg = 0.5 * B1_neg;
         const Scalar A2_neg = (cl_lo - cd_max_ * sin_lo * cos_lo) * (std::abs(sin_lo) / std::max(cos_lo * cos_lo, 0.05));
 
-        // 根据 alpha 正负平滑选择对应侧系数，并处理 |alpha| > pi/2 的深失速/反流对称区
         const Scalar sin_a     = sin(alpha);
         const Scalar cos_a     = cos(alpha);
         const Scalar sin_2a    = 2.0 * sin_a * cos_a;

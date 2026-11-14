@@ -6,7 +6,7 @@
 namespace bemt {
 
 /**
- * @brief 基于隐函数定理 (Implicit Function Theorem, IFT) 与前向自动微分 Dual<8>
+ * @brief 基于隐函数定理 (Implicit Function Theorem, IFT) 与前向自动微分 Dual<9>
  *        计算全桨盘气动力/力矩/功率对展向几何分布 (chord, twist) 及全局工况参数的解析梯度。
  *
  * @param solver 已配置好几何与修正开关的 BEMT 求解器引用
